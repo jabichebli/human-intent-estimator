@@ -12,7 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 # Tune architecture with conv_channels, kernel_sizes, pool_after_layers, classifier_hidden_dim, and dropout.
 # Early stopping monitors validation loss with early_stopping_patience and early_stopping_min_delta.
 config = TrainingConfig(
-    data_dir=ROOT_DIR / "bag data" / "Processed Data" / "front_back",
+    data_dir=ROOT_DIR / "bag_data" / "processed_data" / "front_back",
     train_x_filenames=["X_fb_1.npy", "X_fb_2.npy"],
     train_y_filenames=["y_fb_1.npy", "y_fb_2.npy"],
     val_x_filename=None,

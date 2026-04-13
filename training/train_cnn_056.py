@@ -6,7 +6,7 @@ from train_cnn_common import TrainingConfig, run_training
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT_DIR / "bag data" / "Processed Data" / "up_down"
+DATA_DIR = ROOT_DIR / "bag_data" / "processed_data" / "up_down"
 
 # Choose from: "ff", "accel", "q", "dq", "arm_angles", "arm_currents"
 # This config trains the 0/5/6 classifier from the 150 ms processed up/down bags.

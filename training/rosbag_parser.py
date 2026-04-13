@@ -8,9 +8,9 @@ from rosbags.highlevel import AnyReader
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT_DIR / "bag data"
-RAW_BAGS_DIR = DATA_DIR / "Raw bag"
-PROCESSED_DATA_DIR = DATA_DIR / "Processed Data"
+DATA_DIR = ROOT_DIR / "bag_data"
+RAW_BAGS_DIR = DATA_DIR / "raw_bag"
+PROCESSED_DATA_DIR = DATA_DIR / "processed_data"
 
 PUSH_EVENT_TOPIC = "/data/push_event"
 LOWSTATE_TOPIC = "/lowstate"
