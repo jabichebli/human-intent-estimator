@@ -43,17 +43,15 @@ def parse_args():
         help="How to derive validation folds from the training bags.",
     )
     parser.add_argument(
-        "--append-delta-features",
-        dest="append_delta_features",
-        action="store_true",
-        default=True,
-        help="Append per-window delta features alongside the raw features.",
-    )
-    parser.add_argument(
-        "--no-append-delta-features",
-        dest="append_delta_features",
-        action="store_false",
-        help="Use only the raw selected features.",
+        "--delta-mode",
+        default="append",
+        choices=["replace", "append", "none"],
+        help=(
+            "How to use delta features. "
+            "'replace': feed only change-from-window-start (pose-invariant, default). "
+            "'append': feed raw features + deltas alongside each other. "
+            "'none': feed only raw absolute features."
+        ),
     )
     return parser.parse_args()
 
@@ -65,8 +63,10 @@ def make_config(
     derived_val_fraction: float,
     train_sampling_mode: str,
     derived_split_mode: str,
-    append_delta_features: bool,
+    delta_mode: str,
 ) -> TrainingConfig:
+    use_delta_features = delta_mode == "replace"
+    append_delta_features = delta_mode == "append"
     return TrainingConfig(
         data_dir=DATA_DIR,
         train_x_filenames=[f"X_ud_{bag}{tag}.npy" for bag in train_bags],
@@ -75,7 +75,7 @@ def make_config(
         val_y_filename=None,
         test_x_filename=f"X_ud_{test_bag}{tag}.npy",
         test_y_filename=f"y_ud_{test_bag}{tag}.npy",
-        selected_features=["arm_angles", "arm_currents", "ff", "accel"],
+        selected_features=["arm_angles", "arm_currents", "ff", "accel", "dq"],
         artifact_stem=f"intent_up_down{tag}_lobo_test{test_bag}",
         derived_val_fraction=derived_val_fraction,
         derived_split_mode=derived_split_mode,
@@ -102,7 +102,7 @@ def make_config(
         seed=42,
         weight_decay=1e-4,
         use_lr_scheduler=True,
-        use_delta_features=False,
+        use_delta_features=use_delta_features,
         append_delta_features=append_delta_features,
         use_gravity_comp=False,
         train_segment_min_gap_sec=None,
@@ -125,7 +125,7 @@ def main():
                 derived_val_fraction=args.derived_val_fraction,
                 train_sampling_mode=args.train_sampling_mode,
                 derived_split_mode=args.derived_split_mode,
-                append_delta_features=args.append_delta_features,
+                delta_mode=args.delta_mode,
             )
         )
         results.append((test_bag, result))
@@ -154,7 +154,7 @@ def main():
     print(f"derived_val_fraction={args.derived_val_fraction}")
     print(f"derived_split_mode={args.derived_split_mode}")
     print(f"train_sampling_mode={args.train_sampling_mode}")
-    print(f"append_delta_features={args.append_delta_features}")
+    print(f"delta_mode={args.delta_mode}")
     print(f"avg_test_acc={avg_test_acc:.4f}")
     print(f"avg_macro_f1={avg_macro_f1:.4f}")
     print(f"avg_worst_class_f1={avg_worst_class_f1:.4f}")

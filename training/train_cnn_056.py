@@ -12,8 +12,13 @@ DATA_DIR = ROOT_DIR / "bag_data" / "processed_data" / "up_down"
 # This config trains the 0/5/6 classifier from the 300 ms processed up/down bags.
 # The default dataset uses a 0.60 s exclusion buffer around nonzero segments and
 # drops windows whose history crosses a label transition.
-# Appending delta features to the raw features was the strongest variant tested so far.
-# Training also uses file-balanced sampling so bag_2 does not dominate every epoch.
+# Delta features are appended alongside raw features (append_delta_features=True).
+#   Replace-only mode (use_delta_features=True) was tested and performs significantly
+#   worse — the absolute arm position is informative and must be retained.
+# dq (leg motor velocities) is included as a contextual signal — leg loading shifts
+#   subtly when someone pushes on the arm. Run eval_up_down_lobo.py --delta-mode append
+#   vs the original feature set to verify whether dq improves cross-bag generalisation.
+# Training also uses file-balanced sampling so no single bag dominates every epoch.
 # Tune architecture with conv_channels, kernel_sizes, pool_after_layers, classifier_hidden_dim, and dropout.
 # Early stopping monitors validation loss with early_stopping_patience and early_stopping_min_delta.
 config = TrainingConfig(
@@ -30,7 +35,7 @@ config = TrainingConfig(
     derived_val_fraction=0.5,
     derived_split_mode="stratified_windows",
     split_seed=42,
-    selected_features=["arm_angles", "arm_currents", "ff", "accel"],
+    selected_features=["arm_angles", "arm_currents", "ff", "accel", "dq"],
     artifact_stem="intent_up_down",
     export_artifacts=True,
     batch_size=64,
