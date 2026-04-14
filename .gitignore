@@ -1,3 +1,4 @@
 /bag_data
 __pycache__/
 settings.json
+settings.local.json

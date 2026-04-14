@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 from pathlib import Path
+import random
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -60,6 +61,11 @@ class TrainingConfig:
     dropout: float = 0.2
     early_stopping_patience: int | None = None
     early_stopping_min_delta: float = 0.0
+    seed: int | None = None
+    weight_decay: float = 0.0
+    use_lr_scheduler: bool = False
+    use_delta_features: bool = False
+    use_gravity_comp: bool = False
 
 
 def write_deploy_yaml(
@@ -74,6 +80,9 @@ def write_deploy_yaml(
     x_std,
     selected_features,
     onnx_opset_version,
+    use_delta_features,
+    gravity_comp_W=None,
+    gravity_comp_b=None,
 ):
     feature_lines = []
     for name in selected_features:
@@ -107,6 +116,17 @@ def write_deploy_yaml(
         *[f"    {int(index)}: {int(label)}" for index, label in index_to_label.items()],
         "preprocessing:",
         "  normalize: true",
+        f"  delta_features: {str(use_delta_features).lower()}",
+        f"  gravity_comp: {str(gravity_comp_W is not None).lower()}",
+        *([
+            "  gravity_comp_type: sinusoidal",
+            f"  gravity_comp_W: {gravity_comp_W.tolist()}",
+            *(
+                [f"  gravity_comp_b: {gravity_comp_b.tolist()}"]
+                if gravity_comp_b is not None
+                else []
+            ),
+        ] if gravity_comp_W is not None else []),
         f"  x_mean: {x_mean.reshape(-1).astype(float).tolist()}",
         f"  x_std: {x_std.reshape(-1).astype(float).tolist()}",
     ]
@@ -386,6 +406,7 @@ class PushCNN(nn.Module):
                     padding=kernel_size // 2,
                 )
             )
+            layers.append(nn.BatchNorm1d(out_channels))
             layers.append(nn.ReLU())
             if layer_idx in pool_after_layers:
                 layers.append(nn.MaxPool1d(kernel_size=2))
@@ -406,6 +427,11 @@ class PushCNN(nn.Module):
 
 
 def run_training(config: TrainingConfig):
+    if config.seed is not None:
+        random.seed(config.seed)
+        np.random.seed(config.seed)
+        torch.manual_seed(config.seed)
+
     validate_paired_filenames(config.val_x_filename, config.val_y_filename, "val")
     validate_paired_filenames(config.test_x_filename, config.test_y_filename, "test")
     validate_model_config(config)
@@ -506,6 +532,87 @@ def run_training(config: TrainingConfig):
         y_val = y_val.astype(np.int64)
     y_test = y_test.astype(np.int64)
 
+    if config.use_delta_features:
+        # Subtract the first timestep from every timestep in each window.
+        # X shape: (N, T, F). X[:, 0:1, :] broadcasts over T.
+        # NOTE: only useful if windows capture push onset. For sustained-push
+        # windows the delta is near-zero for all classes → not recommended.
+        X_train = X_train - X_train[:, 0:1, :]
+        if X_val is not None:
+            X_val = X_val - X_val[:, 0:1, :]
+        X_test = X_test - X_test[:, 0:1, :]
+
+    # Gravity compensation: subtract expected neutral current predicted from arm
+    # angles using a linear fit on neutral training samples.  Residual current =
+    # actual_current − gravity_component is configuration-invariant:  neutral → 0,
+    # up push → negative, down push → positive regardless of arm height.
+    gravity_comp_W = None
+    gravity_comp_b = None
+    if config.use_gravity_comp:
+        required_feats = {"arm_angles", "arm_currents"}
+        if not required_feats.issubset(set(config.selected_features)):
+            raise ValueError(
+                f"use_gravity_comp requires 'arm_angles' and 'arm_currents' in "
+                f"selected_features, got {config.selected_features}."
+            )
+        # Compute local feature offsets within the selected feature block.
+        offset = 0
+        angle_start = angle_end = current_start = current_end = None
+        for feat in config.selected_features:
+            w = FEATURE_SLICES[feat][1] - FEATURE_SLICES[feat][0]
+            if feat == "arm_angles":
+                angle_start, angle_end = offset, offset + w
+            elif feat == "arm_currents":
+                current_start, current_end = offset, offset + w
+            offset += w
+
+        # Fit sinusoidal model: arm_currents ≈ [sin(θ), cos(θ), 1] @ W, using only
+        # neutral training samples.  sin/cos basis is physically correct (gravity
+        # torques follow sin(joint_angle)) and avoids the linear-extrapolation error
+        # that causes the model to over-predict expected current at extreme angles.
+        neutral_mask = y_train == 0
+        if neutral_mask.sum() < 20:
+            raise RuntimeError(
+                f"Only {neutral_mask.sum()} neutral training samples — too few to "
+                "fit gravity compensation. Need ≥20."
+            )
+        X_neutral = X_train[neutral_mask]
+        n_ang = angle_end - angle_start
+        angles_flat = X_neutral[:, :, angle_start:angle_end].reshape(-1, n_ang)
+        currents_flat = X_neutral[:, :, current_start:current_end].reshape(-1, current_end - current_start)
+        angles_rad = angles_flat * np.float32(np.pi / 180.0)
+        A = np.hstack([
+            np.sin(angles_rad),
+            np.cos(angles_rad),
+            np.ones((len(angles_flat), 1), dtype=np.float32),
+        ]).astype(np.float32)
+        W_b, _, _, _ = np.linalg.lstsq(A, currents_flat, rcond=None)
+        # W_b shape: (2*n_ang+1, n_currents) — bias is the last row
+        gravity_comp_W = W_b.astype(np.float32)
+        gravity_comp_b = None  # absorbed into last row of gravity_comp_W
+
+        def _apply_gcomp(X_arr):
+            ang = X_arr[:, :, angle_start:angle_end].reshape(-1, n_ang)
+            ang_rad = ang * np.float32(np.pi / 180.0)
+            basis = np.hstack([
+                np.sin(ang_rad),
+                np.cos(ang_rad),
+                np.ones((len(ang), 1), dtype=np.float32),
+            ]).astype(np.float32)
+            pred = (basis @ gravity_comp_W).reshape(X_arr.shape[0], X_arr.shape[1], -1)
+            out = X_arr.copy()
+            out[:, :, current_start:current_end] -= pred
+            return out
+
+        X_train = _apply_gcomp(X_train)
+        if X_val is not None:
+            X_val = _apply_gcomp(X_val)
+        X_test = _apply_gcomp(X_test)
+        print(
+            f"Gravity comp (sinusoidal): fit on {neutral_mask.sum()} neutral samples | "
+            f"W shape={gravity_comp_W.shape} (sin+cos+bias basis)"
+        )
+
     x_mean = X_train.mean(axis=(0, 1), keepdims=True)
     x_std = X_train.std(axis=(0, 1), keepdims=True)
     x_std[x_std < 1e-6] = 1.0
@@ -515,10 +622,14 @@ def run_training(config: TrainingConfig):
         X_val = np.transpose((X_val - x_mean) / x_std, (0, 2, 1))
     X_test = np.transpose((X_test - x_mean) / x_std, (0, 2, 1))
 
+    _dl_generator = torch.Generator()
+    if config.seed is not None:
+        _dl_generator.manual_seed(config.seed)
     train_loader = DataLoader(
         TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long)),
         batch_size=config.batch_size,
         shuffle=True,
+        generator=_dl_generator,
     )
     val_loader = None
     if X_val is not None and y_val is not None:
@@ -558,7 +669,18 @@ def run_training(config: TrainingConfig):
         class_weights = torch.tensor(class_weights / class_weights.mean(), dtype=torch.float32, device=device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = (
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6
+        )
+        if config.use_lr_scheduler
+        else None
+    )
 
     print(f"Device={device} | features={config.selected_features} | raw_labels={list(raw_label_set)}")
     print_section("Run Setup")
@@ -578,6 +700,11 @@ def run_training(config: TrainingConfig):
         "Early stopping: "
         f"patience={config.early_stopping_patience} | "
         f"min_delta={config.early_stopping_min_delta}"
+    )
+    print(
+        f"Optimizer: lr={config.learning_rate} | weight_decay={config.weight_decay} | "
+        f"lr_scheduler={'ReduceLROnPlateau(factor=0.5,patience=5)' if config.use_lr_scheduler else 'none'} | "
+        f"seed={config.seed}"
     )
     val_count = len(y_val) if y_val is not None else 0
     print(f"Samples: train={len(y_train)}, val={val_count}, test={len(y_test)}")
@@ -644,6 +771,12 @@ def run_training(config: TrainingConfig):
             epoch_metrics.extend([f"val_loss={val_loss:.4f}", f"val_acc={val_acc:.4f}"])
             val_losses.append(val_loss)
             val_accs.append(val_acc)
+            if scheduler is not None:
+                prev_lr = optimizer.param_groups[0]["lr"]
+                scheduler.step(val_loss)
+                new_lr = optimizer.param_groups[0]["lr"]
+                if new_lr != prev_lr:
+                    epoch_metrics.append(f"lr={new_lr:.2e}")
         else:
             val_losses.append(np.nan)
             val_accs.append(np.nan)
@@ -753,6 +886,9 @@ def run_training(config: TrainingConfig):
             x_std,
             config.selected_features,
             config.onnx_opset_version,
+            config.use_delta_features,
+            gravity_comp_W=gravity_comp_W,
+            gravity_comp_b=gravity_comp_b,
         )
         print("Saved deploy metadata to:", deploy_yaml_path)
     else:
