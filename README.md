@@ -1,229 +1,157 @@
 # Human Intent Estimator
 
-Train lightweight 1D CNNs that estimate human push intent around a Unitree Go2 from ROS 2 bag data. This repository turns raw MCAP/rosbag recordings into fixed-length NumPy windows, then trains separate 3-class classifiers for front/back, left/right, and up/down intent.
+Train 1D CNNs that estimate push intent around a Unitree Go2 from ROS 2 bag data.
 
-The codebase is small on purpose: the scripts in `training/` are the interface.
+Commands below assume you are in the repo root.
 
-## What This Project Does
+## Quick Start
 
-The pipeline is:
-
-1. Read raw bag data from `bag_data/raw_bag/`
-2. Extract synchronized telemetry around `/data/push_event` timestamps
-3. Build fixed-history windows from robot state and arm state
-4. Remap labels into one neutral class plus one directional pair
-5. Train a 1D CNN for that pair
-6. Optionally export PyTorch, ONNX, and deployment metadata artifacts
-
-Each trained model predicts one of three classes:
-
-- `0`: neutral / no selected push intent
-- directional label A
-- directional label B
-
-The three label families used in this repo are:
-
-- front/back: raw labels `1` and `2`
-- left/right: raw labels `3` and `4`
-- up/down: raw labels `5` and `6`
-
-## Repository Layout
-
-```text
-human-intent-estimator/
-|- bag_data/
-|  |- raw_bag/                 # source rosbag/MCAP recordings
-|  \- processed_data/
-|     |- front_back/
-|     |- left_right/
-|     \- up_down/
-|- training/
-|  |- rosbag_parser.py         # bag -> NumPy window dataset
-|  |- train_cnn_common.py      # shared training/eval/export logic
-|  |- train_cnn_012.py         # front/back experiment
-|  |- train_cnn_034.py         # left/right experiment
-|  \- train_cnn_056.py         # up/down experiment
-\- README.md
-```
-
-## Data and Feature Schema
-
-`training/rosbag_parser.py` builds one sample per selected push-event timestamp. Each sample is a history window ending at that timestamp.
-
-Required topics:
-
-- `/data/push_event`
-- `/lowstate`
-
-Optional topic:
-
-- `/arm_angles`
-
-If `/arm_angles` is missing, the parser fills arm-angle and arm-current features with zeros so dataset generation still succeeds.
-
-The full per-timestep feature vector has 45 values:
-
-| Feature block | Width | Source topic |
-| --- | ---: | --- |
-| foot forces (`ff`) | 4 | `/lowstate` |
-| IMU accelerometer (`accel`) | 3 | `/lowstate` |
-| joint positions (`q`) | 12 | `/lowstate` |
-| joint velocities (`dq`) | 12 | `/lowstate` |
-| arm angles (`arm_angles`) | 7 | `/arm_angles` |
-| arm currents (`arm_currents`) | 7 | `/arm_angles` |
-
-Saved arrays look like:
-
-- `X_*.npy`: shape `(N, T, 45)`
-- `y_*.npy`: shape `(N,)`
-
-Where:
-
-- `N` = number of windows
-- `T` = number of timesteps in the history window
-- `45` = full feature width before feature selection
-
-For example, a `300 ms` window at `200 Hz` produces `T = 60`.
-
-## Preprocessing Logic
-
-For a chosen label pair:
-
-- the selected raw labels stay in their original raw numbering
-- all other labels are remapped to `0`
-- class `0` can be downsampled to reduce imbalance
-- windows near nonzero events can be excluded from neutral sampling with `--exclude-sec`
-
-The parser also infers the processed output directory from the bag name:
-
-- `go2_data_fb_*` -> `bag_data/processed_data/front_back/`
-- `go2_data_lr_*` -> `bag_data/processed_data/left_right/`
-- `go2_data_ud_*` or `go2_data_air_updown*` -> `bag_data/processed_data/up_down/`
-
-## Setup
-
-This repo does not currently include a pinned `requirements.txt` or `pyproject.toml`, so install the packages imported by the scripts.
-
-Recommended starting point on Windows PowerShell:
+If you just want to train the current up/down model using the processed `.npy` files already in this repo, run:
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install numpy matplotlib scikit-learn rosbags torch
-pip install onnx onnxscript
+uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_cnn_056.py
 ```
 
-Notes:
+That is a good default right now. You do **not** need a separate virtualenv if you use `uv run`.
 
-- `torch`, `numpy`, `scikit-learn`, `matplotlib`, and `rosbags` are used directly by the repo.
-- `onnx` and `onnxscript` are useful when artifact export is enabled.
-- `train_cnn_common.py` will use `mps`, then `cuda`, then `cpu`, whichever is available.
-
-## Generate Processed Datasets
-
-Run the parser from the repo root:
+If you already have your own Python environment set up with the dependencies installed, the command is just:
 
 ```powershell
-python training\rosbag_parser.py --bag-name go2_data_fb_1 --keep-pair 12
-python training\rosbag_parser.py --bag-name go2_data_lr_3 --keep-pair 34
-python training\rosbag_parser.py --bag-name go2_data_ud_6 --keep-pair 56 --window-ms 300 --output-tag _w300
-```
-
-Useful parser flags:
-
-- `--bag-name`: bag folder under `bag_data/raw_bag/`
-- `--keep-pair`: one of `12`, `34`, `56`
-- `--exclude-sec`: neutral exclusion buffer around nonzero segments
-- `--window-ms`: history length in milliseconds
-- `--sampling-hz`: resampling frequency for each history window
-- `--downsample-zero-class` / `--no-downsample-zero-class`
-- `--output-tag`: suffix added to the output filename, such as `_w300`
-
-Example output files:
-
-```text
-bag_data/processed_data/up_down/X_ud_6_w300.npy
-bag_data/processed_data/up_down/y_ud_6_w300.npy
-```
-
-## Train the Models
-
-Each training script is a complete experiment configuration. Edit the `TrainingConfig` in the script you care about, then run it.
-
-```powershell
-python training\train_cnn_012.py
-python training\train_cnn_034.py
 python training\train_cnn_056.py
 ```
 
-Current experiment defaults:
+## Up/Down Model Selection
 
-| Script | Intent pair | Raw labels | Current selected features | Split strategy |
-| --- | --- | --- | --- | --- |
-| `train_cnn_012.py` | front/back | `(0, 1, 2)` | `arm_angles`, `arm_currents` | derived split from `fb_1` and `fb_2` |
-| `train_cnn_034.py` | left/right | `(0, 3, 4)` | `ff`, `accel`, `dq` | train on `lr_1`, `lr_2`; test on `lr_3` |
-| `train_cnn_056.py` | up/down | `(0, 5, 6)` | `arm_angles`, `arm_currents`, `ff`, `accel` | train on `ud_2`-`ud_5`; split `ud_6_w300` into val/test |
+The current default in `training\train_cnn_056.py` is the `_w300_e060_hpure` up/down dataset.
+It uses:
 
-Training output includes:
+- a `0.60 s` exclusion buffer around nonzero segments
+- a history-purity filter so a `300 ms` window is dropped if its history crosses a label transition
+- file-balanced training sampling (`uniform_files`)
+- appended per-window delta features on top of the raw features
 
-- run configuration summary
-- per-epoch loss and accuracy
-- confusion matrix in raw labels
-- classification report in raw labels
-- optional learning curves
+That choice is intentional:
 
-## Model Architecture
+- `train_cnn_056.py` is mainly for training and exporting the current best up/down model
+- its built-in validation/test path uses a derived split inside bag `6`
+- final dataset selection should be based on the stricter whole-bag holdout evaluation, not only the derived split
 
-`training/train_cnn_common.py` defines a configurable 1D CNN:
+In practice, this means:
 
-- stacked `Conv1d + BatchNorm1d + ReLU`
-- optional `MaxPool1d` after selected layers
-- flattened classifier head with dropout
-- weighted cross-entropy for class imbalance
-- optional validation-driven early stopping
-- optional `ReduceLROnPlateau`
-- optional delta features and gravity compensation
+- `_w300_e060_hpure` + appended delta features is the strongest recipe tested so far
+- the leave-one-bag-out sweep is still the right check for deployment confidence, because the derived split inside one bag is easier than a true unseen-bag test
 
-Input tensors are normalized with training-set statistics and rearranged to `NCT` format before training and export.
+Use this command for the current swapped whole-bag check:
 
-## Exported Artifacts
-
-When `export_artifacts=True`, training writes files to:
-
-```text
-bag_data/processed_data/<intent_pair>/models/
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib,onnxscript python training\eval_up_down_wholebag.py
 ```
 
-Artifacts:
+To compare another tag:
 
-- `*.pt`: PyTorch checkpoint with model state and preprocessing metadata
-- `*.onnx`: exported ONNX model
-- `*.deploy.yaml`: deployment metadata, including:
-  - selected feature slices
-  - raw-label to class-index mapping
-  - normalization statistics
-  - ONNX input/output names
-  - timestep and feature dimensions
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib,onnxscript python training\eval_up_down_wholebag.py --tag _w300_e045
+```
 
-## A Typical Workflow
+For a broader deployment-style check across all up/down bags:
 
-1. Drop a new bag into `bag_data/raw_bag/`
-2. Run `training/rosbag_parser.py` with the correct `--keep-pair`
-3. Verify the output landed in the expected processed-data folder
-4. Update the relevant training script with the new dataset filenames
-5. Train the model
-6. Turn on artifact export if you want fresh `.pt`, `.onnx`, and `.deploy.yaml` files
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib,onnxscript python training\eval_up_down_lobo.py
+```
 
-## Gotchas
+Rule of thumb:
 
-- All train/val/test datasets for a run must have the same timestep count and feature layout.
-- The parser keeps selected labels in raw numbering instead of collapsing them to `1` and `2`; the training code remaps them internally.
-- `train_cnn_012.py` currently has `export_artifacts=False`, so it will not write fresh model files unless you change that setting.
-- There is no packaged library API yet; the scripts are the intended entry points.
+- use `train_cnn_056.py` to train/export the current up/down model
+- use `eval_up_down_wholebag.py` to decide which processed up/down dataset is actually best
 
-## Next Improvements Worth Making
+## Which Script Trains What?
 
-- add a pinned dependency file
-- add a small evaluation script for running a saved `.pt` or `.onnx` model on new windows
-- store experiment metrics alongside each exported model
-- document the upstream meaning of labels `1` through `6` in one place
+| Script | Labels | Meaning |
+| --- | --- | --- |
+| `training\train_cnn_012.py` | `0,1,2` | front/back |
+| `training\train_cnn_034.py` | `0,3,4` | left/right |
+| `training\train_cnn_056.py` | `0,5,6` | up/down |
+
+So if you want:
+
+- front/back: `python training\train_cnn_012.py`
+- left/right: `python training\train_cnn_034.py`
+- up/down: `python training\train_cnn_056.py`
+
+With `uv`, the equivalent pattern is:
+
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_cnn_034.py
+```
+
+If `export_artifacts=False` in the script, you can usually drop `onnx` and `onnxscript`.
+
+## When Do I Need The Parser?
+
+You only need `training\rosbag_parser.py` when you want to create new processed datasets from raw bags.
+
+If you are training with the existing `.npy` files already under `bag_data\processed_data\`, skip this step.
+
+Example for rebuilding the up/down dataset:
+
+```powershell
+uv run --with numpy,rosbags python training\rosbag_parser.py --bag-name go2_data_ud_6 --keep-pair 56 --window-ms 300 --output-tag _w300
+```
+
+More examples:
+
+```powershell
+uv run --with numpy,rosbags python training\rosbag_parser.py --bag-name go2_data_fb_1 --keep-pair 12
+uv run --with numpy,rosbags python training\rosbag_parser.py --bag-name go2_data_lr_3 --keep-pair 34
+```
+
+Raw bags live in `bag_data\raw_bag\`. Processed datasets are written to:
+
+- `bag_data\processed_data\front_back\`
+- `bag_data\processed_data\left_right\`
+- `bag_data\processed_data\up_down\`
+
+## What The Training Scripts Expect
+
+Each training script already contains its own `TrainingConfig`, including:
+
+- which `.npy` files to use
+- which features to train on
+- train/val/test split strategy
+- model size and optimization settings
+- whether to export `.pt`, `.onnx`, and `.deploy.yaml`
+
+The current `train_cnn_056.py` setup trains on the processed up/down datasets and exports model artifacts.
+
+## Outputs
+
+When artifact export is enabled, files are written under:
+
+```text
+bag_data\processed_data\<task>\models\
+```
+
+Typical outputs:
+
+- `*.pt`
+- `*.onnx`
+- `*.deploy.yaml`
+
+## Minimal Workflow
+
+1. If you already have processed `.npy` files, run the training script directly.
+2. If you only have raw bags, run `rosbag_parser.py` first.
+3. Edit the matching `train_cnn_0xx.py` file if you want different datasets or hyperparameters.
+4. Train again.
+
+## Repo Layout
+
+```text
+training\rosbag_parser.py    # raw bag -> X_*.npy and y_*.npy
+training\train_cnn_common.py # shared training / eval / export code
+training\train_cnn_012.py    # front/back model
+training\train_cnn_034.py    # left/right model
+training\train_cnn_056.py    # up/down model
+training\eval_up_down_wholebag.py # stricter swapped whole-bag evaluation for up/down
+training\eval_up_down_lobo.py # leave-one-bag-out evaluation for up/down
+```

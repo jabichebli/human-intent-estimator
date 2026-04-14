@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from sklearn.metrics import classification_report, confusion_matrix
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 
 FEATURE_SLICES = {
@@ -30,6 +30,22 @@ ALLOWED_LABEL_SETS = [
     (0, 5, 6),
 ]
 
+ALLOWED_SELECTION_METRICS = {
+    "accuracy",
+    "macro_f1",
+    "worst_class_f1",
+}
+
+ALLOWED_TRAIN_SAMPLING_MODES = {
+    "shuffle",
+    "uniform_files",
+}
+
+ALLOWED_DERIVED_SPLIT_MODES = {
+    "stratified_windows",
+    "stratified_segments",
+}
+
 
 @dataclass(frozen=True)
 class TrainingConfig:
@@ -43,15 +59,18 @@ class TrainingConfig:
     test_x_filename: str | None = None
     test_y_filename: str | None = None
     derived_val_fraction: float = 0.5
+    derived_split_mode: str = "stratified_windows"
     split_seed: int = 42
     export_artifacts: bool = True
     batch_size: int = 64
     learning_rate: float = 3e-4
     num_epochs: int = 20
+    label_smoothing: float = 0.0
     onnx_opset_version: int = 18
     manual_class_loss_weights: list[float] | None = None
     nonzero_prediction_threshold: float | None = None
     selection_split: str = "val"
+    selection_metric: str = "accuracy"
     zero_division: int = 0
     show_learning_curves: bool = True
     conv_channels: tuple[int, ...] = (32, 64, 128)
@@ -65,7 +84,10 @@ class TrainingConfig:
     weight_decay: float = 0.0
     use_lr_scheduler: bool = False
     use_delta_features: bool = False
+    append_delta_features: bool = False
     use_gravity_comp: bool = False
+    train_segment_min_gap_sec: float | None = None
+    train_sampling_mode: str = "shuffle"
 
 
 def write_deploy_yaml(
@@ -80,7 +102,7 @@ def write_deploy_yaml(
     x_std,
     selected_features,
     onnx_opset_version,
-    use_delta_features,
+    delta_feature_mode,
     gravity_comp_W=None,
     gravity_comp_b=None,
 ):
@@ -116,7 +138,8 @@ def write_deploy_yaml(
         *[f"    {int(index)}: {int(label)}" for index, label in index_to_label.items()],
         "preprocessing:",
         "  normalize: true",
-        f"  delta_features: {str(use_delta_features).lower()}",
+        f"  delta_features: {str(delta_feature_mode != 'off').lower()}",
+        f"  delta_feature_mode: {delta_feature_mode}",
         f"  gravity_comp: {str(gravity_comp_W is not None).lower()}",
         *([
             "  gravity_comp_type: sinusoidal",
@@ -183,6 +206,136 @@ def load_and_concat_datasets(data_dir, x_filenames, y_filenames):
     return np.concatenate(X_parts, axis=0), np.concatenate(y_parts, axis=0)
 
 
+def sidecar_filename_for_x(x_filename, prefix):
+    if not x_filename.startswith("X_"):
+        raise ValueError(
+            f"Expected X filename to start with 'X_', got {x_filename!r}."
+        )
+    return prefix + x_filename[2:]
+
+
+def segment_gap_keep_indices(timestamps_ns, segment_ids, min_gap_ns):
+    if min_gap_ns <= 0:
+        return np.arange(len(segment_ids), dtype=np.int64)
+
+    if not (len(timestamps_ns) == len(segment_ids)):
+        raise ValueError(
+            "Segment subsampling sidecars must match timestamp/segment lengths: "
+            f"len(t)={len(timestamps_ns)}, len(seg)={len(segment_ids)}."
+        )
+
+    keep_indices = []
+    segment_start = 0
+
+    while segment_start < len(segment_ids):
+        segment_id = segment_ids[segment_start]
+        segment_end = segment_start + 1
+        while segment_end < len(segment_ids) and segment_ids[segment_end] == segment_id:
+            segment_end += 1
+
+        keep_indices.append(segment_start)
+        last_kept_t_ns = timestamps_ns[segment_start]
+
+        for idx in range(segment_start + 1, segment_end - 1):
+            if timestamps_ns[idx] - last_kept_t_ns >= min_gap_ns:
+                keep_indices.append(idx)
+                last_kept_t_ns = timestamps_ns[idx]
+
+        last_idx = segment_end - 1
+        if last_idx != keep_indices[-1]:
+            keep_indices.append(last_idx)
+
+        segment_start = segment_end
+
+    return np.array(keep_indices, dtype=np.int64)
+
+
+def subsample_by_segment_gap(X, y, timestamps_ns, segment_ids, min_gap_ns):
+    if not (len(X) == len(y) == len(timestamps_ns) == len(segment_ids)):
+        raise ValueError(
+            "Segment subsampling sidecars must match X/y lengths: "
+            f"len(X)={len(X)}, len(y)={len(y)}, len(t)={len(timestamps_ns)}, "
+            f"len(seg)={len(segment_ids)}."
+        )
+
+    keep_indices = segment_gap_keep_indices(timestamps_ns, segment_ids, min_gap_ns)
+    return X[keep_indices], y[keep_indices]
+
+
+def load_and_concat_train_datasets(config: TrainingConfig):
+    X_parts = []
+    y_parts = []
+    source_parts = []
+    group_parts = []
+    original_samples = 0
+    kept_samples = 0
+
+    if len(config.train_x_filenames) != len(config.train_y_filenames):
+        raise ValueError(
+            f"Mismatched train file lists: {len(config.train_x_filenames)} X files vs "
+            f"{len(config.train_y_filenames)} y files."
+        )
+    if len(config.train_x_filenames) == 0:
+        raise ValueError("At least one train X/y file pair is required.")
+
+    min_gap_ns = None
+    if config.train_segment_min_gap_sec is not None:
+        min_gap_ns = int(round(config.train_segment_min_gap_sec * 1e9))
+
+    for source_idx, (x_filename, y_filename) in enumerate(
+        zip(config.train_x_filenames, config.train_y_filenames)
+    ):
+        X_part = np.load(config.data_dir / x_filename)
+        y_part = np.load(config.data_dir / y_filename)
+        if len(X_part) != len(y_part):
+            raise ValueError(
+                f"Sample count mismatch for {x_filename} and {y_filename}: "
+                f"{len(X_part)} vs {len(y_part)}."
+            )
+
+        original_samples += len(y_part)
+
+        need_segment_sidecar = min_gap_ns is not None or config.derived_split_mode == "stratified_segments"
+        segment_ids = None
+        timestamps_ns = None
+        if need_segment_sidecar:
+            t_filename = sidecar_filename_for_x(x_filename, "t_")
+            seg_filename = sidecar_filename_for_x(x_filename, "seg_")
+            timestamps_ns = np.load(config.data_dir / t_filename)
+            segment_ids = np.load(config.data_dir / seg_filename)
+
+        if min_gap_ns is not None:
+            keep_indices = segment_gap_keep_indices(
+                timestamps_ns=timestamps_ns,
+                segment_ids=segment_ids,
+                min_gap_ns=min_gap_ns,
+            )
+            X_part = X_part[keep_indices]
+            y_part = y_part[keep_indices]
+            segment_ids = segment_ids[keep_indices]
+
+        kept_samples += len(y_part)
+        X_parts.append(X_part)
+        y_parts.append(y_part)
+        source_parts.append(np.full(len(y_part), source_idx, dtype=np.int64))
+        if config.derived_split_mode == "stratified_segments":
+            global_group_ids = (np.int64(source_idx) << 32) + segment_ids.astype(np.int64)
+            group_parts.append(global_group_ids)
+
+    train_group_ids = None
+    if config.derived_split_mode == "stratified_segments":
+        train_group_ids = np.concatenate(group_parts, axis=0)
+
+    return (
+        np.concatenate(X_parts, axis=0),
+        np.concatenate(y_parts, axis=0),
+        np.concatenate(source_parts, axis=0),
+        train_group_ids,
+        original_samples,
+        kept_samples,
+    )
+
+
 def load_dataset_pair(data_dir, x_filename, y_filename):
     X = np.load(data_dir / x_filename)
     y = np.load(data_dir / y_filename)
@@ -193,7 +346,7 @@ def load_dataset_pair(data_dir, x_filename, y_filename):
     return X, y
 
 
-def stratified_split_dataset(X, y, first_fraction, seed):
+def stratified_split_indices(y, first_fraction, seed):
     if not 0.0 < first_fraction < 1.0:
         raise ValueError(f"first_fraction must be between 0 and 1, got {first_fraction}.")
 
@@ -218,6 +371,58 @@ def stratified_split_dataset(X, y, first_fraction, seed):
     if len(first_indices) == 0 or len(second_indices) == 0:
         raise ValueError("Derived val/test split produced an empty dataset.")
 
+    return first_indices, second_indices
+
+
+def stratified_group_split_indices(y, group_ids, first_fraction, seed):
+    if not 0.0 < first_fraction < 1.0:
+        raise ValueError(f"first_fraction must be between 0 and 1, got {first_fraction}.")
+    if len(y) != len(group_ids):
+        raise ValueError(f"y and group_ids must have the same length, got {len(y)} and {len(group_ids)}.")
+
+    rng = np.random.default_rng(seed)
+    first_group_ids = []
+    second_group_ids = []
+
+    for label in np.unique(y):
+        label_group_ids = np.unique(group_ids[y == label])
+        shuffled = rng.permutation(label_group_ids)
+        if len(shuffled) == 1:
+            split_count = 1
+        else:
+            split_count = int(round(len(shuffled) * first_fraction))
+            split_count = min(max(split_count, 1), len(shuffled) - 1)
+        first_group_ids.append(shuffled[:split_count])
+        second_group_ids.append(shuffled[split_count:])
+
+    first_group_ids = np.concatenate(first_group_ids)
+    second_group_ids = np.concatenate(second_group_ids)
+    first_indices = np.where(np.isin(group_ids, first_group_ids))[0]
+    second_indices = np.where(np.isin(group_ids, second_group_ids))[0]
+
+    if len(first_indices) == 0 or len(second_indices) == 0:
+        raise ValueError("Derived val/test split produced an empty dataset.")
+
+    return np.sort(first_indices), np.sort(second_indices)
+
+
+def derived_split_indices(y, first_fraction, seed, split_mode, group_ids=None):
+    if split_mode == "stratified_windows":
+        return stratified_split_indices(y, first_fraction=first_fraction, seed=seed)
+    if split_mode == "stratified_segments":
+        if group_ids is None:
+            raise ValueError("group_ids are required for derived_split_mode='stratified_segments'.")
+        return stratified_group_split_indices(
+            y,
+            group_ids=group_ids,
+            first_fraction=first_fraction,
+            seed=seed,
+        )
+    raise ValueError(f"Unsupported derived split mode: {split_mode!r}")
+
+
+def stratified_split_dataset(X, y, first_fraction, seed):
+    first_indices, second_indices = stratified_split_indices(y, first_fraction, seed)
     return X[first_indices], y[first_indices], X[second_indices], y[second_indices]
 
 
@@ -272,6 +477,54 @@ def evaluate(model, loader, criterion, device, nonzero_threshold=None):
             total_correct += (preds == yb).sum().item()
             total_count += xb.size(0)
     return total_loss / total_count, total_correct / total_count
+
+
+def compute_prediction_metrics(targets, preds, zero_division):
+    present_labels = np.unique(targets)
+    report_dict = classification_report(
+        targets,
+        preds,
+        labels=present_labels,
+        output_dict=True,
+        zero_division=zero_division,
+    )
+    per_class_f1 = [report_dict[str(int(label))]["f1-score"] for label in present_labels]
+    return {
+        "accuracy": float((preds == targets).mean()),
+        "macro_f1": float(report_dict["macro avg"]["f1-score"]),
+        "worst_class_f1": float(min(per_class_f1)),
+    }
+
+
+def evaluate_with_metrics(
+    model,
+    loader,
+    criterion,
+    device,
+    zero_division,
+    nonzero_threshold=None,
+):
+    model.eval()
+    total_loss = 0.0
+    total_count = 0
+    all_preds = []
+    all_targets = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            preds = predict_classes(logits, nonzero_threshold)
+            total_loss += loss.item() * xb.size(0)
+            total_count += xb.size(0)
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(yb.cpu().numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_targets = np.concatenate(all_targets)
+    metrics = compute_prediction_metrics(all_targets, all_preds, zero_division)
+    return total_loss / total_count, metrics
 
 
 def format_class_counts(y, raw_label_set, index_to_label):
@@ -375,9 +628,33 @@ def validate_model_config(config: TrainingConfig):
         raise ValueError(
             f"early_stopping_patience must be positive or None, got {config.early_stopping_patience}."
         )
+    if not 0.0 <= config.label_smoothing < 1.0:
+        raise ValueError(f"label_smoothing must be in [0, 1), got {config.label_smoothing}.")
     if config.early_stopping_min_delta < 0.0:
         raise ValueError(
             f"early_stopping_min_delta must be non-negative, got {config.early_stopping_min_delta}."
+        )
+    if config.train_segment_min_gap_sec is not None and config.train_segment_min_gap_sec < 0.0:
+        raise ValueError(
+            "train_segment_min_gap_sec must be non-negative or None, got "
+            f"{config.train_segment_min_gap_sec}."
+        )
+    if config.use_delta_features and config.append_delta_features:
+        raise ValueError("use_delta_features and append_delta_features cannot both be enabled.")
+    if config.selection_metric not in ALLOWED_SELECTION_METRICS:
+        raise ValueError(
+            f"selection_metric must be one of {sorted(ALLOWED_SELECTION_METRICS)}, "
+            f"got {config.selection_metric!r}."
+        )
+    if config.derived_split_mode not in ALLOWED_DERIVED_SPLIT_MODES:
+        raise ValueError(
+            f"derived_split_mode must be one of {sorted(ALLOWED_DERIVED_SPLIT_MODES)}, "
+            f"got {config.derived_split_mode!r}."
+        )
+    if config.train_sampling_mode not in ALLOWED_TRAIN_SAMPLING_MODES:
+        raise ValueError(
+            f"train_sampling_mode must be one of {sorted(ALLOWED_TRAIN_SAMPLING_MODES)}, "
+            f"got {config.train_sampling_mode!r}."
         )
 
 
@@ -439,10 +716,8 @@ def run_training(config: TrainingConfig):
     if config.selection_split not in {"val", "test"}:
         raise ValueError(f"selection_split must be 'val' or 'test', got {config.selection_split!r}.")
 
-    X_train, y_train = load_and_concat_datasets(
-        config.data_dir,
-        config.train_x_filenames,
-        config.train_y_filenames,
+    X_train, y_train, train_source_ids, train_group_ids, original_train_samples, kept_train_samples = (
+        load_and_concat_train_datasets(config)
     )
 
     X_val = y_val = None
@@ -457,22 +732,35 @@ def run_training(config: TrainingConfig):
             config.val_y_filename,
         )
         if config.test_x_filename is None:
-            X_val, y_val, X_test, y_test = stratified_split_dataset(
-                X_val_source,
+            val_group_ids = None
+            if config.derived_split_mode == "stratified_segments":
+                seg_filename = sidecar_filename_for_x(config.val_x_filename, "seg_")
+                val_group_ids = np.load(config.data_dir / seg_filename).astype(np.int64)
+            val_indices, test_indices = derived_split_indices(
                 y_val_source,
                 first_fraction=config.derived_val_fraction,
                 seed=config.split_seed,
+                split_mode=config.derived_split_mode,
+                group_ids=val_group_ids,
             )
+            X_val, y_val = X_val_source[val_indices], y_val_source[val_indices]
+            X_test, y_test = X_val_source[test_indices], y_val_source[test_indices]
             test_source_label = f"{config.val_x_filename} (derived split)"
         else:
             X_val, y_val = X_val_source, y_val_source
     elif config.test_x_filename is not None:
-        X_val, y_val, X_train, y_train = stratified_split_dataset(
-            X_train,
+        val_indices, train_indices = derived_split_indices(
             y_train,
             first_fraction=config.derived_val_fraction,
             seed=config.split_seed,
+            split_mode=config.derived_split_mode,
+            group_ids=train_group_ids,
         )
+        X_val, y_val = X_train[val_indices], y_train[val_indices]
+        X_train, y_train = X_train[train_indices], y_train[train_indices]
+        train_source_ids = train_source_ids[train_indices]
+        if train_group_ids is not None:
+            train_group_ids = train_group_ids[train_indices]
         val_source_label = "train files (derived split)"
 
     if config.test_x_filename is not None:
@@ -484,12 +772,30 @@ def run_training(config: TrainingConfig):
 
     if X_test is None or y_test is None:
         if X_val is None or y_val is None:
-            X_train, y_train, X_val, y_val, X_test, y_test = stratified_train_val_test_split(
-                X_train,
+            val_indices, remaining_indices = derived_split_indices(
                 y_train,
-                val_fraction=config.derived_val_fraction,
+                first_fraction=config.derived_val_fraction,
                 seed=config.split_seed,
+                split_mode=config.derived_split_mode,
+                group_ids=train_group_ids,
             )
+            X_val, y_val = X_train[val_indices], y_train[val_indices]
+            X_remaining, y_remaining = X_train[remaining_indices], y_train[remaining_indices]
+            remaining_source_ids = train_source_ids[remaining_indices]
+            remaining_group_ids = None if train_group_ids is None else train_group_ids[remaining_indices]
+            test_fraction_of_remaining = config.derived_val_fraction / (1.0 - config.derived_val_fraction)
+            test_indices, train_indices = derived_split_indices(
+                y_remaining,
+                first_fraction=test_fraction_of_remaining,
+                seed=config.split_seed + 1,
+                split_mode=config.derived_split_mode,
+                group_ids=remaining_group_ids,
+            )
+            X_test, y_test = X_remaining[test_indices], y_remaining[test_indices]
+            X_train, y_train = X_remaining[train_indices], y_remaining[train_indices]
+            train_source_ids = remaining_source_ids[train_indices]
+            if remaining_group_ids is not None:
+                train_group_ids = remaining_group_ids[train_indices]
             val_source_label = "train files (derived split)"
             test_source_label = "train files (derived split)"
     if config.selection_split == "val" and (X_val is None or y_val is None):
@@ -532,6 +838,7 @@ def run_training(config: TrainingConfig):
         y_val = y_val.astype(np.int64)
     y_test = y_test.astype(np.int64)
 
+    delta_feature_mode = "off"
     if config.use_delta_features:
         # Subtract the first timestep from every timestep in each window.
         # X shape: (N, T, F). X[:, 0:1, :] broadcasts over T.
@@ -541,6 +848,13 @@ def run_training(config: TrainingConfig):
         if X_val is not None:
             X_val = X_val - X_val[:, 0:1, :]
         X_test = X_test - X_test[:, 0:1, :]
+        delta_feature_mode = "replace"
+    elif config.append_delta_features:
+        X_train = np.concatenate([X_train, X_train - X_train[:, 0:1, :]], axis=2)
+        if X_val is not None:
+            X_val = np.concatenate([X_val, X_val - X_val[:, 0:1, :]], axis=2)
+        X_test = np.concatenate([X_test, X_test - X_test[:, 0:1, :]], axis=2)
+        delta_feature_mode = "append"
 
     # Gravity compensation: subtract expected neutral current predicted from arm
     # angles using a linear fit on neutral training samples.  Residual current =
@@ -613,6 +927,7 @@ def run_training(config: TrainingConfig):
             f"W shape={gravity_comp_W.shape} (sin+cos+bias basis)"
         )
 
+    _, T, F = X_train.shape
     x_mean = X_train.mean(axis=(0, 1), keepdims=True)
     x_std = X_train.std(axis=(0, 1), keepdims=True)
     x_std[x_std < 1e-6] = 1.0
@@ -625,10 +940,33 @@ def run_training(config: TrainingConfig):
     _dl_generator = torch.Generator()
     if config.seed is not None:
         _dl_generator.manual_seed(config.seed)
+    train_dataset = TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.long),
+    )
+    train_sampler = None
+    train_shuffle = True
+    train_sampling_desc = config.train_sampling_mode
+    if config.train_sampling_mode == "uniform_files":
+        file_counts = np.bincount(train_source_ids, minlength=len(config.train_x_filenames)).astype(np.float64)
+        sample_weights = np.array(
+            [1.0 / max(file_counts[source_idx], 1.0) for source_idx in train_source_ids],
+            dtype=np.float64,
+        )
+        sample_weights *= len(sample_weights) / sample_weights.sum()
+        train_sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+            generator=_dl_generator,
+        )
+        train_shuffle = False
+        train_sampling_desc += f" (file_counts={file_counts.astype(int).tolist()})"
     train_loader = DataLoader(
-        TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long)),
+        train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         generator=_dl_generator,
     )
     val_loader = None
@@ -668,7 +1006,10 @@ def run_training(config: TrainingConfig):
         class_weights = class_counts.sum() / np.maximum(class_counts, 1.0)
         class_weights = torch.tensor(class_weights / class_weights.mean(), dtype=torch.float32, device=device)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=config.label_smoothing,
+    )
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=config.learning_rate,
@@ -703,9 +1044,19 @@ def run_training(config: TrainingConfig):
     )
     print(
         f"Optimizer: lr={config.learning_rate} | weight_decay={config.weight_decay} | "
+        f"label_smoothing={config.label_smoothing} | "
         f"lr_scheduler={'ReduceLROnPlateau(factor=0.5,patience=5)' if config.use_lr_scheduler else 'none'} | "
         f"seed={config.seed}"
     )
+    print(f"Selection: split={config.selection_split} | metric={config.selection_metric}")
+    print(f"Derived split mode: {config.derived_split_mode}")
+    print(f"Delta feature mode: {delta_feature_mode}")
+    print(
+        "Train segment subsampling: "
+        f"min_gap_sec={config.train_segment_min_gap_sec} | "
+        f"kept={kept_train_samples}/{original_train_samples}"
+    )
+    print(f"Train sampling: {train_sampling_desc}")
     val_count = len(y_val) if y_val is not None else 0
     print(f"Samples: train={len(y_train)}, val={val_count}, test={len(y_test)}")
 
@@ -720,7 +1071,8 @@ def run_training(config: TrainingConfig):
     print(f"Loss weights: {class_weights.detach().cpu().numpy().tolist()}")
     print(f"Thresholded inference: {config.nonzero_prediction_threshold}")
 
-    best_selection_acc = -1.0
+    best_selection_score = -1.0
+    best_selection_metrics = None
     best_state = None
     train_losses = []
     train_accs = []
@@ -766,9 +1118,19 @@ def run_training(config: TrainingConfig):
 
         val_acc = None
         val_loss = None
+        val_metrics = None
         if val_loader is not None:
-            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            val_loss, val_metrics = evaluate_with_metrics(
+                model,
+                val_loader,
+                criterion,
+                device,
+                zero_division=config.zero_division,
+            )
+            val_acc = val_metrics["accuracy"]
             epoch_metrics.extend([f"val_loss={val_loss:.4f}", f"val_acc={val_acc:.4f}"])
+            if config.selection_metric != "accuracy":
+                epoch_metrics.append(f"val_{config.selection_metric}={val_metrics[config.selection_metric]:.4f}")
             val_losses.append(val_loss)
             val_accs.append(val_acc)
             if scheduler is not None:
@@ -782,15 +1144,28 @@ def run_training(config: TrainingConfig):
             val_accs.append(np.nan)
 
         if config.selection_split == "val":
-            selection_acc = val_acc
+            selection_metrics = val_metrics
             test_losses.append(np.nan)
             test_accs.append(np.nan)
         else:
-            test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-            selection_acc = test_acc
+            test_loss, test_metrics = evaluate_with_metrics(
+                model,
+                test_loader,
+                criterion,
+                device,
+                zero_division=config.zero_division,
+            )
+            test_acc = test_metrics["accuracy"]
+            selection_metrics = test_metrics
             epoch_metrics.extend([f"test_loss={test_loss:.4f}", f"test_acc={test_acc:.4f}"])
+            if config.selection_metric != "accuracy":
+                epoch_metrics.append(
+                    f"test_{config.selection_metric}={test_metrics[config.selection_metric]:.4f}"
+                )
             test_losses.append(test_loss)
             test_accs.append(test_acc)
+
+        selection_score = selection_metrics[config.selection_metric]
 
         if config.early_stopping_patience is not None and val_loss is not None:
             if val_loss < best_val_loss - config.early_stopping_min_delta:
@@ -802,11 +1177,15 @@ def run_training(config: TrainingConfig):
                 f"early_stop_wait={early_stopping_wait}/{config.early_stopping_patience}"
             )
 
-        epoch_metrics.append(f"best_{config.selection_split}_acc={max(best_selection_acc, selection_acc):.4f}")
+        epoch_metrics.append(
+            f"best_{config.selection_split}_{config.selection_metric}="
+            f"{max(best_selection_score, selection_score):.4f}"
+        )
         print(" | ".join(epoch_metrics))
 
-        if selection_acc > best_selection_acc:
-            best_selection_acc = selection_acc
+        if selection_score > best_selection_score:
+            best_selection_score = selection_score
+            best_selection_metrics = dict(selection_metrics)
             best_state = {
                 "model_state_dict": copy.deepcopy(model.state_dict()),
                 "num_classes": num_classes,
@@ -822,7 +1201,12 @@ def run_training(config: TrainingConfig):
                 "pool_after_layers": config.pool_after_layers,
                 "classifier_hidden_dim": config.classifier_hidden_dim,
                 "dropout": config.dropout,
-                f"best_{config.selection_split}_acc": best_selection_acc,
+                "train_segment_min_gap_sec": config.train_segment_min_gap_sec,
+                "derived_split_mode": config.derived_split_mode,
+                "delta_feature_mode": delta_feature_mode,
+                "selection_metric": config.selection_metric,
+                f"best_{config.selection_split}_{config.selection_metric}": best_selection_score,
+                f"best_{config.selection_split}_acc": best_selection_metrics["accuracy"],
             }
 
         if (
@@ -839,6 +1223,8 @@ def run_training(config: TrainingConfig):
 
     if best_state is None:
         raise RuntimeError("Training finished without producing a best checkpoint.")
+    if best_selection_metrics is None:
+        raise RuntimeError("Training finished without recording best selection metrics.")
 
     out_dir = config.data_dir / "models"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -886,7 +1272,7 @@ def run_training(config: TrainingConfig):
             x_std,
             config.selected_features,
             config.onnx_opset_version,
-            config.use_delta_features,
+            delta_feature_mode,
             gravity_comp_W=gravity_comp_W,
             gravity_comp_b=gravity_comp_b,
         )
@@ -907,7 +1293,8 @@ def run_training(config: TrainingConfig):
 
     print_section("Final Evaluation")
     print(
-        f"Best {config.selection_split}_acc={best_selection_acc:.4f} | "
+        f"Best {config.selection_split}_{config.selection_metric}={best_selection_score:.4f} | "
+        f"best_{config.selection_split}_acc={best_selection_metrics['accuracy']:.4f} | "
         f"final_test_loss={test_loss:.4f} | final_test_acc={test_acc:.4f} | "
         f"thresholded_test_acc={thresholded_test_acc:.4f}"
     )
@@ -973,7 +1360,9 @@ def run_training(config: TrainingConfig):
         )
 
     return {
-        "best_selection_acc": float(best_selection_acc),
+        "selection_metric": config.selection_metric,
+        "best_selection_score": float(best_selection_score),
+        "best_selection_acc": float(best_selection_metrics["accuracy"]),
         "final_test_loss": float(test_loss),
         "final_test_acc": float(test_acc),
         "thresholded_test_acc": float(thresholded_test_acc),

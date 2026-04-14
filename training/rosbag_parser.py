@@ -42,6 +42,14 @@ def parse_args():
     parser.add_argument("--window-ms", type=int, default=200)
     parser.add_argument("--sampling-hz", type=int, default=200)
     parser.add_argument(
+        "--require-full-history-in-segment",
+        action="store_true",
+        help=(
+            "Keep a sample only when its full history window stays inside the current "
+            "contiguous label segment."
+        ),
+    )
+    parser.add_argument(
         "--downsample-zero-class",
         dest="downsample_zero_class",
         action="store_true",
@@ -99,6 +107,7 @@ processed_subdir = processed_subdir_from_bag_name(bagpath.name)
 keep_pair = args.keep_pair
 exclude_sec = args.exclude_sec
 downsample_zero_class = args.downsample_zero_class
+require_full_history_in_segment = args.require_full_history_in_segment
 sliding_window_ms = args.window_ms
 sampling_hz = args.sampling_hz
 dt_s = 1.0 / sampling_hz
@@ -153,6 +162,22 @@ def build_label_segments(times_ns, labels):
         "end_ns": int(times_ns[-1]),
     })
     return segments
+
+
+def build_segment_ids(labels):
+    """Assign a contiguous segment id to each label sample."""
+    if len(labels) == 0:
+        return np.array([], dtype=np.int64)
+
+    segment_ids = np.zeros(len(labels), dtype=np.int64)
+    current_segment_id = 0
+
+    for i in range(1, len(labels)):
+        if labels[i] != labels[i - 1]:
+            current_segment_id += 1
+        segment_ids[i] = current_segment_id
+
+    return segment_ids
 
 
 def is_clean_zero_time(t_ns, nonzero_segments, exclude_ns):
@@ -291,6 +316,7 @@ print("processed label counts:", {k: int(np.sum(push_labels == k)) for k in [0] 
 print("window_ms:", sliding_window_ms)
 print("sampling_hz:", sampling_hz)
 print("num_steps:", num_steps)
+print("require_full_history_in_segment:", require_full_history_in_segment)
 
 print("lowstate_t_ns shape:", lowstate_t_ns.shape)
 print("arm_angles_t_ns shape:", arm_angles_t_ns.shape)
@@ -306,7 +332,9 @@ print("arm_currents shape:", arm_currents.shape)
 # Exclusion zone only around the selected raw pair
 # ----------------
 segments = build_label_segments(push_t_ns, push_labels)
+push_segment_ids = build_segment_ids(push_labels)
 nonzero_segments = [seg for seg in segments if seg["label"] in kept_labels]
+segment_start_ns_by_id = np.array([seg["start_ns"] for seg in segments], dtype=np.int64)
 
 # ----------------
 # Keep all selected nonzero labels
@@ -316,26 +344,37 @@ history_ns = (num_steps - 1) * dt_ns
 
 selected_t_ns = []
 selected_labels = []
+selected_segment_ids = []
+dropped_history_crossing = 0
 
-for t_ns, label in zip(push_t_ns, push_labels):
-    if t_ns - history_ns < lowstate_t_ns[0]:
+for t_ns, label, segment_id in zip(push_t_ns, push_labels, push_segment_ids):
+    window_start_ns = t_ns - history_ns
+    if window_start_ns < lowstate_t_ns[0]:
         continue
-    if t_ns - history_ns < arm_angles_t_ns[0]:
+    if window_start_ns < arm_angles_t_ns[0]:
+        continue
+    if require_full_history_in_segment and window_start_ns < segment_start_ns_by_id[segment_id]:
+        dropped_history_crossing += 1
         continue
 
     if label == 0:
         if is_clean_zero_time(t_ns, nonzero_segments, exclude_ns):
             selected_t_ns.append(int(t_ns))
             selected_labels.append(0)
+            selected_segment_ids.append(int(segment_id))
     else:
         selected_t_ns.append(int(t_ns))
         selected_labels.append(int(label))
+        selected_segment_ids.append(int(segment_id))
 
 selected_t_ns = np.array(selected_t_ns, dtype=np.int64)
 selected_labels = np.array(selected_labels, dtype=np.int64)
+selected_segment_ids = np.array(selected_segment_ids, dtype=np.int64)
 
 if len(selected_t_ns) == 0:
     raise ValueError("No valid samples were selected after applying the history-window filters.")
+
+print("dropped history-crossing samples:", dropped_history_crossing)
 
 # ----------------
 # Downsample class 0
@@ -363,6 +402,7 @@ if downsample_zero_class:
 
     selected_t_ns = selected_t_ns[keep_idx]
     selected_labels = selected_labels[keep_idx]
+    selected_segment_ids = selected_segment_ids[keep_idx]
 
 counts = {k: int(np.sum(selected_labels == k)) for k in [0] + kept_labels}
 print("class counts after downsampling:", counts)
@@ -384,6 +424,7 @@ X_arm_angles = []
 X_arm_currents = []
 y = []
 valid_t_ns = []
+valid_segment_ids = []
 
 for i in range(len(grid_ns)):
     X_ff.append(sample_nearest(lowstate_t_ns, lowstate_ff, grid_ns[i]))
@@ -395,6 +436,7 @@ for i in range(len(grid_ns)):
 
     y.append(selected_labels[i])
     valid_t_ns.append(selected_t_ns[i])
+    valid_segment_ids.append(selected_segment_ids[i])
 
 X_ff = np.stack(X_ff, axis=0)
 X_accel = np.stack(X_accel, axis=0)
@@ -405,6 +447,7 @@ X_arm_currents = np.stack(X_arm_currents, axis=0)
 
 y = np.array(y, dtype=np.int64)
 valid_t_ns = np.array(valid_t_ns, dtype=np.int64)
+valid_segment_ids = np.array(valid_segment_ids, dtype=np.int64)
 
 print("final class counts:", {k: int(np.sum(y == k)) for k in [0] + kept_labels})
 
@@ -421,10 +464,16 @@ out_dir.mkdir(parents=True, exist_ok=True)
 output_suffix = args.output_tag.strip()
 x_path = out_dir / f'X_{dataset_suffix}{output_suffix}.npy'
 y_path = out_dir / f'y_{dataset_suffix}{output_suffix}.npy'
+t_path = out_dir / f't_{dataset_suffix}{output_suffix}.npy'
+seg_path = out_dir / f'seg_{dataset_suffix}{output_suffix}.npy'
 
 np.save(x_path, X)
 np.save(y_path, y)
+np.save(t_path, valid_t_ns)
+np.save(seg_path, valid_segment_ids)
 
 print("Saved:")
 print(x_path)
 print(y_path)
+print(t_path)
+print(seg_path)

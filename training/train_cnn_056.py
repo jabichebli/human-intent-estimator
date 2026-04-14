@@ -9,22 +9,26 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "bag_data" / "processed_data" / "up_down"
 
 # Choose from: "ff", "accel", "q", "dq", "arm_angles", "arm_currents"
-# This config trains the 0/5/6 classifier from the 150 ms processed up/down bags.
-# Best local result used the full feature set with a slightly wider temporal receptive field.
+# This config trains the 0/5/6 classifier from the 300 ms processed up/down bags.
+# The default dataset uses a 0.60 s exclusion buffer around nonzero segments and
+# drops windows whose history crosses a label transition.
+# Appending delta features to the raw features was the strongest variant tested so far.
+# Training also uses file-balanced sampling so bag_2 does not dominate every epoch.
 # Tune architecture with conv_channels, kernel_sizes, pool_after_layers, classifier_hidden_dim, and dropout.
 # Early stopping monitors validation loss with early_stopping_patience and early_stopping_min_delta.
 config = TrainingConfig(
     data_dir=DATA_DIR,
-    # Leave-one-bag-out: train on 4 bags, hold out ud_6 entirely as val+test.
-    # ud_2 spans multiple arm heights so normalization covers the full range.
-    # This is the most honest accuracy estimate for deployment generalization.
-    train_x_filenames=["X_ud_2_w300.npy", "X_ud_3_w300.npy", "X_ud_4_w300.npy", "X_ud_5_w300.npy"],
-    train_y_filenames=["y_ud_2_w300.npy", "y_ud_3_w300.npy", "y_ud_4_w300.npy", "y_ud_5_w300.npy"],
-    val_x_filename="X_ud_6_w300.npy",
-    val_y_filename="y_ud_6_w300.npy",
+    # Train on ud_2-ud_5 and derive val/test splits from ud_6 for quick iteration.
+    # Use eval_up_down_wholebag.py / eval_up_down_lobo.py for final comparisons
+    # across held-out bags before changing this default again.
+    train_x_filenames=["X_ud_2_w300_e060_hpure.npy", "X_ud_3_w300_e060_hpure.npy", "X_ud_4_w300_e060_hpure.npy", "X_ud_5_w300_e060_hpure.npy"],
+    train_y_filenames=["y_ud_2_w300_e060_hpure.npy", "y_ud_3_w300_e060_hpure.npy", "y_ud_4_w300_e060_hpure.npy", "y_ud_5_w300_e060_hpure.npy"],
+    val_x_filename="X_ud_6_w300_e060_hpure.npy",
+    val_y_filename="y_ud_6_w300_e060_hpure.npy",
     test_x_filename=None,
     test_y_filename=None,
     derived_val_fraction=0.5,
+    derived_split_mode="stratified_windows",
     split_seed=42,
     selected_features=["arm_angles", "arm_currents", "ff", "accel"],
     artifact_stem="intent_up_down",
@@ -49,7 +53,9 @@ config = TrainingConfig(
     weight_decay=1e-4,
     use_lr_scheduler=True,
     use_delta_features=False,
+    append_delta_features=True,
     use_gravity_comp=False,
+    train_sampling_mode="uniform_files",
 )
 
 
