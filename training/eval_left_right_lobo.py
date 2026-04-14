@@ -7,21 +7,21 @@ from train_cnn_common import TrainingConfig, run_training
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT_DIR / "bag_data" / "processed_data" / "up_down"
+DATA_DIR = ROOT_DIR / "bag_data" / "processed_data" / "left_right"
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--tag",
-        default="_w300_e060_hpure",
-        help="Dataset suffix to evaluate, e.g. '_w300_e045' or '_w300_e060'.",
+        default="",
+        help="Dataset suffix to evaluate, e.g. '' (plain bags) or '_w300_e060_hpure'.",
     )
     parser.add_argument(
         "--bags",
         nargs="+",
         type=int,
-        default=[2, 3, 4, 5, 6],
+        default=[1, 2, 3],
         help="Bag ids to use for leave-one-bag-out evaluation.",
     )
     parser.add_argument(
@@ -69,14 +69,14 @@ def make_config(
 ) -> TrainingConfig:
     return TrainingConfig(
         data_dir=DATA_DIR,
-        train_x_filenames=[f"X_ud_{bag}{tag}.npy" for bag in train_bags],
-        train_y_filenames=[f"y_ud_{bag}{tag}.npy" for bag in train_bags],
+        train_x_filenames=[f"X_lr_{bag}{tag}.npy" for bag in train_bags],
+        train_y_filenames=[f"y_lr_{bag}{tag}.npy" for bag in train_bags],
         val_x_filename=None,
         val_y_filename=None,
-        test_x_filename=f"X_ud_{test_bag}{tag}.npy",
-        test_y_filename=f"y_ud_{test_bag}{tag}.npy",
-        selected_features=["arm_angles", "arm_currents", "ff", "accel"],
-        artifact_stem=f"intent_up_down{tag}_lobo_test{test_bag}",
+        test_x_filename=f"X_lr_{test_bag}{tag}.npy",
+        test_y_filename=f"y_lr_{test_bag}{tag}.npy",
+        selected_features=["ff", "accel", "dq"],
+        artifact_stem=f"intent_left_right{tag}_lobo_test{test_bag}",
         derived_val_fraction=derived_val_fraction,
         derived_split_mode=derived_split_mode,
         split_seed=42,
@@ -116,7 +116,7 @@ def main():
 
     for test_bag in args.bags:
         train_bags = [bag for bag in args.bags if bag != test_bag]
-        print(f"\n===== tag={args.tag} | train={train_bags} | test={test_bag} =====")
+        print(f"\n===== tag={args.tag!r} | train={train_bags} | test={test_bag} =====")
         result = run_training(
             make_config(
                 tag=args.tag,
@@ -129,17 +129,6 @@ def main():
             )
         )
         results.append((test_bag, result))
-        per_class = result["per_class_metrics"]
-        class_f1_str = "  ".join(
-            f"label{label}: f1={m['f1-score']:.3f} p={m['precision']:.3f} r={m['recall']:.3f}"
-            for label, m in sorted(per_class.items())
-        )
-        print(
-            f"--> test_bag={test_bag} | acc={result['final_test_acc']:.4f}"
-            f" | macro_f1={result['macro_f1']:.4f}"
-            f" | worst_class_f1={result['worst_class_f1']:.4f}"
-            f"\n    {class_f1_str}"
-        )
 
     avg_test_acc = sum(result["final_test_acc"] for _, result in results) / len(results)
     avg_macro_f1 = sum(result["macro_f1"] for _, result in results) / len(results)
@@ -149,7 +138,7 @@ def main():
     min_worst_class_f1 = min(result["worst_class_f1"] for _, result in results)
 
     print("\n===== LOBO Summary =====")
-    print(f"tag={args.tag}")
+    print(f"tag={args.tag!r}")
     print(f"bags={args.bags}")
     print(f"derived_val_fraction={args.derived_val_fraction}")
     print(f"derived_split_mode={args.derived_split_mode}")
