@@ -19,8 +19,8 @@ config = TrainingConfig(
     # Train on all bags for the deployment artifact — LOBO already proved generalization.
     # Holding back bag 3 as a test set here would just mean the exported model
     # trains on less data than LOBO's best folds without any new information.
-    train_x_filenames=["X_lr_1.npy", "X_lr_2.npy", "X_lr_3.npy"],
-    train_y_filenames=["y_lr_1.npy", "y_lr_2.npy", "y_lr_3.npy"],
+    train_x_filenames=["X_lr_1_w300_e060_hpure.npy", "X_lr_2_w300_e060_hpure.npy", "X_lr_3_w300_e060_hpure.npy", "X_lr_4_w300_e060_hpure.npy", "X_lr_5_w300_e060_hpure.npy", "X_lr_6_w300_e060_hpure.npy", "X_lr_7_w300_e060_hpure.npy", "X_lr_8_w300_e060_hpure.npy", "X_lr_9_w300_e060_hpure.npy", "X_lr_10_w300_e060_hpure.npy", "X_lr_11_w300_e060_hpure.npy", "X_lr_12_w300_e060_hpure.npy", "X_lr_13_w300_e060_hpure.npy", "X_lr_14_w300_e060_hpure.npy"],
+    train_y_filenames=["y_lr_1_w300_e060_hpure.npy", "y_lr_2_w300_e060_hpure.npy", "y_lr_3_w300_e060_hpure.npy", "y_lr_4_w300_e060_hpure.npy", "y_lr_5_w300_e060_hpure.npy", "y_lr_6_w300_e060_hpure.npy", "y_lr_7_w300_e060_hpure.npy", "y_lr_8_w300_e060_hpure.npy", "y_lr_9_w300_e060_hpure.npy", "y_lr_10_w300_e060_hpure.npy", "y_lr_11_w300_e060_hpure.npy", "y_lr_12_w300_e060_hpure.npy", "y_lr_13_w300_e060_hpure.npy", "y_lr_14_w300_e060_hpure.npy"],
     val_x_filename=None,
     val_y_filename=None,
     test_x_filename=None,

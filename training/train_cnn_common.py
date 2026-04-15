@@ -88,6 +88,7 @@ class TrainingConfig:
     use_gravity_comp: bool = False
     train_segment_min_gap_sec: float | None = None
     train_sampling_mode: str = "shuffle"
+    sampling_hz: int = 200
 
 
 def write_deploy_yaml(
@@ -103,6 +104,7 @@ def write_deploy_yaml(
     selected_features,
     onnx_opset_version,
     delta_feature_mode,
+    sampling_hz=200,
     gravity_comp_W=None,
     gravity_comp_b=None,
 ):
@@ -116,6 +118,9 @@ def write_deploy_yaml(
             f"    width: {end - start}",
         ])
 
+    window_ms = int(round(num_timesteps / sampling_hz * 1000))
+    num_raw_features = num_features // 2 if delta_feature_mode == "append" else num_features
+
     lines = [
         "model:",
         "  format: onnx",
@@ -127,6 +132,8 @@ def write_deploy_yaml(
         "  dynamic_batch: true",
         f"  num_features: {num_features}",
         f"  num_timesteps: {num_timesteps}",
+        f"  sampling_hz: {sampling_hz}",
+        f"  window_ms: {window_ms}",
         "features:",
         "  selected:",
         *feature_lines,
@@ -140,6 +147,13 @@ def write_deploy_yaml(
         "  normalize: true",
         f"  delta_features: {str(delta_feature_mode != 'off').lower()}",
         f"  delta_feature_mode: {delta_feature_mode}",
+        # 'append' mode: concat [raw, raw - raw[0]] along feature axis.
+        # delta[t] = raw[t] - raw[window_start], NOT frame-to-frame differences.
+        # x_mean/x_std cover the full concatenated vector (raw + delta).
+        *([
+            f"  delta_formula: window_start_subtraction",
+            f"  num_raw_features: {num_raw_features}",
+        ] if delta_feature_mode != "off" else []),
         f"  gravity_comp: {str(gravity_comp_W is not None).lower()}",
         *([
             "  gravity_comp_type: sinusoidal",
@@ -1273,6 +1287,7 @@ def run_training(config: TrainingConfig):
             config.selected_features,
             config.onnx_opset_version,
             delta_feature_mode,
+            sampling_hz=config.sampling_hz,
             gravity_comp_W=gravity_comp_W,
             gravity_comp_b=gravity_comp_b,
         )

@@ -70,14 +70,25 @@ def parse_args():
 
 def resolve_bagpath(bags_dir, bag_name):
     bagpath = bags_dir / bag_name
-    if bagpath.exists():
+    if not bagpath.exists():
+        available_bags = sorted(path.name for path in bags_dir.iterdir() if path.is_dir())
+        raise ValueError(
+            f"Bag {bag_name!r} not found under {bags_dir}. "
+            f"Available bag folders: {available_bags}"
+        )
+    # If metadata.yaml lives directly here, this is the bag directory.
+    if (bagpath / "metadata.yaml").exists():
         return bagpath
-
-    available_bags = sorted(path.name for path in bags_dir.iterdir() if path.is_dir())
-    raise ValueError(
-        f"Bag {bag_name!r} not found under {bags_dir}. "
-        f"Available bag folders: {available_bags}"
-    )
+    # Otherwise look one level deeper (common when the recorder wraps bags in a parent folder).
+    subdirs = [p for p in bagpath.iterdir() if p.is_dir() and (p / "metadata.yaml").exists()]
+    if len(subdirs) == 1:
+        return subdirs[0]
+    if len(subdirs) > 1:
+        raise ValueError(
+            f"Multiple bag subdirectories found in {bagpath}: {[s.name for s in subdirs]}. "
+            "Pass the specific subfolder name instead."
+        )
+    raise ValueError(f"No metadata.yaml found in {bagpath} or its immediate subdirectories.")
 
 
 def dataset_suffix_from_bag_name(bag_name):
@@ -102,8 +113,8 @@ def processed_subdir_from_bag_name(bag_name):
 
 args = parse_args()
 bagpath = resolve_bagpath(RAW_BAGS_DIR, args.bag_name)
-dataset_suffix = dataset_suffix_from_bag_name(bagpath.name)
-processed_subdir = processed_subdir_from_bag_name(bagpath.name)
+dataset_suffix = dataset_suffix_from_bag_name(args.bag_name)
+processed_subdir = processed_subdir_from_bag_name(args.bag_name)
 keep_pair = args.keep_pair
 exclude_sec = args.exclude_sec
 downsample_zero_class = args.downsample_zero_class
