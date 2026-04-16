@@ -1,6 +1,53 @@
-/bag_data
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+.claude/
+
+# Python/runtime cache
 __pycache__/
-settings.json
-settings.local.json
-/logs
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local logs and experiment output
+logs/*
+training/logs/*
 *.log
+!logs/.gitkeep
+!training/logs/.gitkeep
+
+# Raw ROS bags and derived datasets are large/private.
+bag_data/raw_bag/*
+bag_data/processed_data/front_back/*
+bag_data/processed_data/left_right/*
+bag_data/processed_data/up_down/*
+
+# Keep the public folder skeleton.
+!bag_data/README.md
+!bag_data/raw_bag/.gitkeep
+!bag_data/processed_data/
+!bag_data/processed_data/front_back/
+!bag_data/processed_data/front_back/.gitkeep
+!bag_data/processed_data/left_right/
+!bag_data/processed_data/left_right/.gitkeep
+!bag_data/processed_data/up_down/
+!bag_data/processed_data/up_down/.gitkeep
+
+# Model artifacts. Keep model folders, not trained weights/exports.
+!bag_data/processed_data/front_back/models/
+!bag_data/processed_data/front_back/models/.gitkeep
+!bag_data/processed_data/left_right/models/
+!bag_data/processed_data/left_right/models/.gitkeep
+!bag_data/processed_data/up_down/models/
+!bag_data/processed_data/up_down/models/.gitkeep
+*.pt
+*.pth
+*.onnx
+*.onnx.data
+*.npy
+*.npz
+*.db3
+*.mcap
+*.sqlite3
+*.deploy.yaml
