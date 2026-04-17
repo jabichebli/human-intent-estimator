@@ -2,8 +2,7 @@
 
 This folder is intentionally committed as structure only.
 
-Do not commit raw bags, processed `.npy` datasets, model weights, ONNX exports,
-or deployment YAML files. They are ignored by `.gitignore`.
+Do not commit raw bags, processed `.npy` datasets, model weights, ONNX exports,or deployment YAML files. They are ignored by `.gitignore`.
 
 Expected local layout:
 
@@ -22,6 +21,4 @@ bag_data/
       models/
 ```
 
-Use `training/rosbag_parser.py` to create processed `.npy` datasets from local
-raw bags. Use the `training/train_cnn_*.py` scripts to create local model
-artifacts under the matching `models/` folder.
+Use `training/rosbag_parser.py` to create processed `.npy` datasets from local raw bags. Use the `training/train_cnn_*.py` scripts to create local model artifacts under the matching `models/` folder.

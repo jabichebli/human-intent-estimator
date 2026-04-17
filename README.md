@@ -1,157 +1,200 @@
 # Human Intent Estimator
 
-Train 1D CNNs that estimate push intent around a Unitree Go2 from ROS 2 bag data.
+Train supervised intent classifiers from ROS 2 bag data for the Unitree Go2 with a D1 arm.
 
-Commands below assume you are in the repo root.
-
-## Quick Start
-
-If you just want to train the current up/down model using the processed `.npy` files already in this repo, run:
+Commands assume PowerShell from the repo root:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_cnn_056.py
+cd C:\Projects\human-intent-estimator
 ```
 
-That is a good default right now. You do **not** need a separate virtualenv if you use `uv run`.
+Use `uv run` for normal CPU runs. You do not need to activate a virtualenv.
 
-If you already have your own Python environment set up with the dependencies installed, the command is just:
+## Current Best Recipes
+
+| Task | Labels | Model | Dataset tag | Features | Inference |
+| --- | --- | --- | --- | --- | --- |
+| left/right | `0,3,4` = rest/left/right | GRU | `_w500_e060_hpure` | `ff accel dq` | argmax |
+| up/down | `0,5,6` = rest/up/down | GRU | `_w500_e060_hpure` | `arm_angles arm_currents` | argmax |
+
+Tag meaning:
+
+- `w500`: each sample contains a `500 ms` history window. At `200 Hz`, that is `100` timesteps.
+- `e060`: remove rest/zero samples within `0.60 s` of action segments, so rest labels are cleaner.
+- `hpure`: keep only samples whose full history window stays inside one contiguous label segment.
+- `argmax`: no extra nonzero confidence threshold; predict the class with the largest model output.
+
+## Rebuild And Check Data
+
+Run this when raw bags changed or you want to regenerate processed `.npy` files.
+
+Up/down:
 
 ```powershell
-python training\train_cnn_056.py
+uv run --with numpy,rosbags python training\rebuild_up_down_datasets.py --tag _w500_e060_hpure --window-ms 500 --exclude-sec 0.60
 ```
 
-## Up/Down Model Selection
-
-The current default in `training\train_cnn_056.py` is the `_w300_e060_hpure` up/down dataset.
-It uses:
-
-- a `0.60 s` exclusion buffer around nonzero segments
-- a history-purity filter so a `300 ms` window is dropped if its history crosses a label transition
-- file-balanced training sampling (`uniform_files`)
-- appended per-window delta features on top of the raw features
-
-That choice is intentional:
-
-- `train_cnn_056.py` is mainly for training and exporting the current best up/down model
-- its built-in validation/test path uses a derived split inside bag `6`
-- final dataset selection should be based on the stricter whole-bag holdout evaluation, not only the derived split
-
-In practice, this means:
-
-- `_w300_e060_hpure` + appended delta features is the strongest recipe tested so far
-- the leave-one-bag-out sweep is still the right check for deployment confidence, because the derived split inside one bag is easier than a true unseen-bag test
-
-Use this command for the current swapped whole-bag check:
+Left/right:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib,onnxscript python training\eval_up_down_wholebag.py
+uv run --with numpy,rosbags python training\rebuild_left_right_datasets.py --tag _w500_e060_hpure --window-ms 500 --exclude-sec 0.60
 ```
 
-To compare another tag:
+Check for exact duplicate raw/processed datasets without reparsing:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib,onnxscript python training\eval_up_down_wholebag.py --tag _w300_e045
+uv run --with numpy,rosbags python training\rebuild_up_down_datasets.py --tag _w500_e060_hpure --check-only
+uv run --with numpy,rosbags python training\rebuild_left_right_datasets.py --tag _w500_e060_hpure --check-only
 ```
 
-For a broader deployment-style check across all up/down bags:
+Good output should say:
+
+```text
+No exact duplicate raw storage groups found.
+No exact duplicate processed dataset groups found.
+```
+
+## Quick Evaluation
+
+Use quick LOBO first. It holds out a few bags and is much faster than full leave-one-bag-out.
+
+Up/down GRU quick check:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib,onnxscript python training\eval_up_down_lobo.py
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w500_e060_hpure --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold none --results-csv logs\quick_ud_gru_w500_e060_hpure_argmax.csv
 ```
 
-Rule of thumb:
-
-- use `train_cnn_056.py` to train/export the current up/down model
-- use `eval_up_down_wholebag.py` to decide which processed up/down dataset is actually best
-
-## Which Script Trains What?
-
-| Script | Labels | Meaning |
-| --- | --- | --- |
-| `training\train_cnn_012.py` | `0,1,2` | front/back |
-| `training\train_cnn_034.py` | `0,3,4` | left/right |
-| `training\train_cnn_056.py` | `0,5,6` | up/down |
-
-So if you want:
-
-- front/back: `python training\train_cnn_012.py`
-- left/right: `python training\train_cnn_034.py`
-- up/down: `python training\train_cnn_056.py`
-
-With `uv`, the equivalent pattern is:
+Left/right GRU quick check:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_cnn_034.py
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type gru --heldout-bags 3 8 11 14 --epochs 35 --nonzero-threshold none --results-csv logs\quick_lr_gru_w500_e060_hpure_argmax.csv
 ```
 
-If `export_artifacts=False` in the script, you can usually drop `onnx` and `onnxscript`.
-
-## When Do I Need The Parser?
-
-You only need `training\rosbag_parser.py` when you want to create new processed datasets from raw bags.
-
-If you are training with the existing `.npy` files already under `bag_data\processed_data\`, skip this step.
-
-Example for rebuilding the up/down dataset:
+Optional CNN baseline, using the same parsed data and argmax inference:
 
 ```powershell
-uv run --with numpy,rosbags python training\rosbag_parser.py --bag-name go2_data_ud_6 --keep-pair 56 --window-ms 300 --output-tag _w300
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w500_e060_hpure --model-type cnn --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold none --results-csv logs\quick_ud_cnn_w500_e060_hpure_argmax.csv
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type cnn --heldout-bags 3 8 11 14 --epochs 35 --nonzero-threshold none --results-csv logs\quick_lr_cnn_w500_e060_hpure_argmax.csv
 ```
 
-More examples:
+Compare CSV summaries:
 
 ```powershell
-uv run --with numpy,rosbags python training\rosbag_parser.py --bag-name go2_data_fb_1 --keep-pair 12
-uv run --with numpy,rosbags python training\rosbag_parser.py --bag-name go2_data_lr_3 --keep-pair 34
+uv run python training\compare_lobo_results.py logs\quick_ud_gru_w500_e060_hpure_argmax.csv logs\quick_ud_cnn_w500_e060_hpure_argmax.csv
+uv run python training\compare_lobo_results.py logs\quick_lr_gru_w500_e060_hpure_argmax.csv logs\quick_lr_cnn_w500_e060_hpure_argmax.csv
 ```
 
-Raw bags live in `bag_data\raw_bag\`. Processed datasets are written to:
+Prefer the model with stronger `avg_macro_f1`, `min_macro_f1`, and `min_worst_class_f1`.
 
-- `bag_data\processed_data\front_back\`
-- `bag_data\processed_data\left_right\`
-- `bag_data\processed_data\up_down\`
+## Full Evaluation
 
-## What The Training Scripts Expect
+Run this before trusting a model for hardware. Full LOBO is slow because it retrains once per held-out bag.
 
-Each training script already contains its own `TrainingConfig`, including:
+Up/down full GRU LOBO:
 
-- which `.npy` files to use
-- which features to train on
-- train/val/test split strategy
-- model size and optimization settings
-- whether to export `.pt`, `.onnx`, and `.deploy.yaml`
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w500_e060_hpure --model-type gru --nonzero-threshold none --results-csv logs\full_ud_gru_w500_e060_hpure_argmax.csv
+```
 
-The current `train_cnn_056.py` setup trains on the processed up/down datasets and exports model artifacts.
+Left/right full GRU LOBO:
+
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type gru --nonzero-threshold none --results-csv logs\full_lr_gru_w500_e060_hpure_argmax.csv
+```
+
+Optional full CNN baselines:
+
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w500_e060_hpure --model-type cnn --nonzero-threshold none --results-csv logs\full_ud_cnn_w500_e060_hpure_argmax.csv
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type cnn --nonzero-threshold none --results-csv logs\full_lr_cnn_w500_e060_hpure_argmax.csv
+```
+
+Compare:
+
+```powershell
+uv run python training\compare_lobo_results.py logs\full_ud_gru_w500_e060_hpure_argmax.csv logs\full_ud_cnn_w500_e060_hpure_argmax.csv
+uv run python training\compare_lobo_results.py logs\full_lr_gru_w500_e060_hpure_argmax.csv logs\full_lr_cnn_w500_e060_hpure_argmax.csv
+```
+
+## Train And Export
+
+These commands train on all selected bags and export `.pt`, `.onnx`, and `.deploy.yaml`.
+
+Up/down export:
+
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_rnn_056.py --tag _w500_e060_hpure --nonzero-threshold none --artifact-stem intent_up_down_gru_w500_e060_hpure_argmax
+```
+
+Left/right export:
+
+```powershell
+uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_rnn_034.py --tag _w500_e060_hpure --nonzero-threshold none --artifact-stem intent_left_right_gru_w500_e060_hpure_argmax
+```
+
+Check exported files:
+
+```powershell
+Get-ChildItem bag_data\processed_data\up_down\models\intent_up_down_gru_w500_e060_hpure_argmax*
+Get-ChildItem bag_data\processed_data\left_right\models\intent_left_right_gru_w500_e060_hpure_argmax*
+```
+
+Inspect deploy metadata:
+
+```powershell
+Get-Content bag_data\processed_data\up_down\models\intent_up_down_gru_w500_e060_hpure_argmax.deploy.yaml
+Get-Content bag_data\processed_data\left_right\models\intent_left_right_gru_w500_e060_hpure_argmax.deploy.yaml
+```
+
+The YAML should include:
+
+- `input_layout: NCT`
+- `input_name: input`
+- `output_name: logits`
+- `model_type: gru`
+- `num_timesteps: 100`
+- `window_ms: 500`
+- `sampling_hz: 200`
+- the correct `raw_label_set`
+- the selected feature blocks
+- normalization statistics
+- delta feature metadata
+- `nonzero_prediction_threshold: null` for argmax inference
+
+## Script Map
+
+| Script | Purpose |
+| --- | --- |
+| `training\rosbag_parser.py` | Convert one raw bag into processed `X/y/t/seg` `.npy` files |
+| `training\rebuild_up_down_datasets.py` | Rebuild/check all up/down bags |
+| `training\rebuild_left_right_datasets.py` | Rebuild/check all left/right bags |
+| `training\eval_up_down_lobo_grouped.py` | Up/down grouped leave-one-bag-out evaluation |
+| `training\eval_left_right_lobo.py` | Left/right leave-one-bag-out evaluation |
+| `training\train_rnn_056.py` | Train/export up/down GRU |
+| `training\train_rnn_034.py` | Train/export left/right GRU |
+| `training\compare_lobo_results.py` | Print compact summaries from LOBO CSV files |
 
 ## Outputs
 
-When artifact export is enabled, files are written under:
+Processed datasets live under:
 
 ```text
-bag_data\processed_data\<task>\models\
+bag_data\processed_data\up_down\
+bag_data\processed_data\left_right\
 ```
 
-Typical outputs:
-
-- `*.pt`
-- `*.onnx`
-- `*.deploy.yaml`
-
-## Minimal Workflow
-
-1. If you already have processed `.npy` files, run the training script directly.
-2. If you only have raw bags, run `rosbag_parser.py` first.
-3. Edit the matching `train_cnn_0xx.py` file if you want different datasets or hyperparameters.
-4. Train again.
-
-## Repo Layout
+Exported models live under:
 
 ```text
-training\rosbag_parser.py    # raw bag -> X_*.npy and y_*.npy
-training\train_cnn_common.py # shared training / eval / export code
-training\train_cnn_012.py    # front/back model
-training\train_cnn_034.py    # left/right model
-training\train_cnn_056.py    # up/down model
-training\eval_up_down_wholebag.py # stricter swapped whole-bag evaluation for up/down
-training\eval_up_down_lobo.py # leave-one-bag-out evaluation for up/down
+bag_data\processed_data\up_down\models\
+bag_data\processed_data\left_right\models\
+```
+
+Typical export files:
+
+```text
+*.pt
+*.onnx
+*.onnx.data
+*.deploy.yaml
 ```

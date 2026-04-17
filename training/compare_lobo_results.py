@@ -51,6 +51,15 @@ def format_value(value):
     return f"{value:.4f}"
 
 
+def label_f1_fields(rows):
+    fields = set()
+    for row in rows:
+        for field in row:
+            if field.startswith("label_") and field.endswith("_f1"):
+                fields.add(field)
+    return sorted(fields, key=lambda field: int(field.split("_")[1]))
+
+
 def main():
     args = parse_args()
     print("===== Summary Ranking =====")
@@ -87,17 +96,16 @@ def main():
             if row.get("row_type") in {"group", "bag"}
         ]
         group_rows.sort(key=lambda row: as_float(row, "macro_f1") or -1.0)
+        per_label_fields = label_f1_fields(group_rows)
         print(f"\n{path.name}")
-        print("test_bag,macro_f1,worst_class_f1,label_0_f1,label_5_f1,label_6_f1")
+        print(",".join(["test_bag", "macro_f1", "worst_class_f1", *per_label_fields]))
         for row in group_rows[: args.worst]:
             print(
                 ",".join([
                     row.get("test_bag", ""),
                     format_value(as_float(row, "macro_f1")),
                     format_value(as_float(row, "worst_class_f1")),
-                    format_value(as_float(row, "label_0_f1")),
-                    format_value(as_float(row, "label_5_f1")),
-                    format_value(as_float(row, "label_6_f1")),
+                    *[format_value(as_float(row, field)) for field in per_label_fields],
                 ])
             )
 
