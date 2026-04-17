@@ -1,0 +1,151 @@
+# Human Intent Up/Down GRU Evaluation Commands
+#
+# Goal:
+# - Keep features arm-only: arm_angles + arm_currents.
+# - Use quick 3-bag mini-LOBO for fast experiments.
+# - Only run full LOBO for the best candidate.
+# - Use Intel XPU/GPU only if it is actually faster than CPU.
+#
+# Hard bags for quick testing:
+# 28 = worst CNN macro F1 / bad label 6
+# 13 = bad rest/zero F1
+# 9  = bad rest/zero F1
+#
+# Current best baseline tag:
+# _w300_e060_hpure = 300 ms window, 0.60 s zero exclusion, full-history purity
+
+
+==============================
+0. Sanity Check Data
+==============================
+
+uv run python training\rebuild_up_down_datasets.py --check-only
+
+
+==============================
+1. Quick Baseline: Current Clean Parse
+==============================
+
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w300_e060_hpure --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold none --results-csv logs\quick3_gru_w300_e060_hpure_tnone.csv
+
+
+==============================
+2. Test No Full-History Purity, 300 ms Window
+==============================
+
+# Reparse:
+uv run --with numpy,rosbags python training\rebuild_up_down_datasets.py --tag _w300_e060 --window-ms 300 --exclude-sec 0.60 --allow-history-crossing
+
+# Evaluate:
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w300_e060 --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold none --results-csv logs\quick3_gru_w300_e060_tnone.csv
+
+
+==============================
+3. Test No Full-History Purity, 500 ms Window
+==============================
+
+# Reparse:
+uv run --with numpy,rosbags python training\rebuild_up_down_datasets.py --tag _w500_e060 --window-ms 500 --exclude-sec 0.60 --allow-history-crossing
+
+# Evaluate:
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w500_e060 --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold none --results-csv logs\quick3_gru_w500_e060_tnone.csv
+
+
+==============================
+4. Test Full-History Purity, 500 ms Window
+==============================
+
+# Reparse:
+uv run --with numpy,rosbags python training\rebuild_up_down_datasets.py --tag _w500_e060_hpure --window-ms 500 --exclude-sec 0.60
+
+# Evaluate:
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w500_e060_hpure --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold none --results-csv logs\quick3_gru_w500_e060_hpure_tnone.csv
+
+
+==============================
+5. Test Less Zero Exclusion, 300 ms Window
+==============================
+
+# Reparse:
+uv run --with numpy,rosbags python training\rebuild_up_down_datasets.py --tag _w300_e030 --window-ms 300 --exclude-sec 0.30 --allow-history-crossing
+
+# Evaluate:
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w300_e030 --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold none --results-csv logs\quick3_gru_w300_e030_tnone.csv
+
+
+==============================
+6. Compare Quick Results
+==============================
+
+uv run python training\compare_lobo_results.py logs\quick3_gru_w300_e060_hpure_tnone.csv logs\quick3_gru_w300_e060_tnone.csv logs\quick3_gru_w500_e060_tnone.csv logs\quick3_gru_w500_e060_hpure_tnone.csv logs\quick3_gru_w300_e030_tnone.csv
+
+
+==============================
+7. Optional: Threshold Check For Best Tag
+==============================
+
+# Replace BEST_TAG below with the best quick parse tag, for example:
+# _w300_e060_hpure
+# _w300_e060
+# _w500_e060
+# _w500_e060_hpure
+# _w300_e030
+
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag BEST_TAG --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold 0.60 --results-csv logs\quick3_gru_BEST_TAG_t060.csv
+
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag BEST_TAG --model-type gru --heldout-bags 28 13 9 --epochs 35 --nonzero-threshold 0.70 --results-csv logs\quick3_gru_BEST_TAG_t070.csv
+
+
+==============================
+8. Optional: CPU vs Intel Arc GPU/XPU Speed Test
+==============================
+
+# CPU timing:
+Measure-Command { uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w300_e060_hpure --model-type gru --heldout-bags 28 --epochs 5 --nonzero-threshold none --results-csv logs\speed_cpu_bag28_e5.csv }
+
+# XPU timing:
+# Only run this if .venv-xpu exists and the check below says xpu available: True.
+.\.venv-xpu\Scripts\python -c "import torch; print(torch.__version__); print('xpu available:', torch.xpu.is_available()); print(torch.xpu.get_device_name(0) if torch.xpu.is_available() else 'NO XPU')"
+
+Measure-Command { .\.venv-xpu\Scripts\python training\eval_up_down_lobo_grouped.py --tag _w300_e060_hpure --model-type gru --heldout-bags 28 --epochs 5 --nonzero-threshold none --results-csv logs\speed_xpu_bag28_e5.csv }
+
+
+==============================
+9. Full LOBO For Winner Only
+==============================
+
+# Replace BEST_TAG and BEST_THRESHOLD.
+# For argmax/no threshold, use:
+# --nonzero-threshold none
+#
+# Example if _w500_e060 wins:
+# uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag _w500_e060 --model-type gru --nonzero-threshold none --results-csv logs\full_gru_w500_e060_tnone.csv
+
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_lobo_grouped.py --tag BEST_TAG --model-type gru --nonzero-threshold BEST_THRESHOLD --results-csv logs\full_gru_BEST_TAG_BEST_THRESHOLD.csv
+
+
+==============================
+10. Final Export For Winner
+==============================
+
+# Replace BEST_TAG, BEST_THRESHOLD, and ARTIFACT_NAME.
+#
+# Example if _w500_e060 wins with no threshold:
+# uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_rnn_056.py --tag _w500_e060 --nonzero-threshold none --artifact-stem intent_up_down_gru_w500_e060_argmax
+
+uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_rnn_056.py --tag BEST_TAG --nonzero-threshold BEST_THRESHOLD --artifact-stem ARTIFACT_NAME
+
+
+==============================
+11. Notes
+==============================
+
+# Do not add ff, accel, dq, or q for this round.
+# We are intentionally staying arm-only:
+# selected features = arm_angles arm_currents
+#
+# If the final full LOBO result is good, hardware test in shadow mode first.
+# Do not directly drive the arm from single-frame predictions.
+# Use smoothing/hysteresis in the runtime:
+# - require several consecutive up/down predictions before commanding motion
+# - require several rest predictions before stopping
