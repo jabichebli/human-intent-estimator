@@ -36,6 +36,11 @@ ALLOWED_SELECTION_METRICS = {
     "worst_class_f1",
 }
 
+ALLOWED_MODEL_TYPES = {
+    "cnn",
+    "gru",
+}
+
 ALLOWED_TRAIN_SAMPLING_MODES = {
     "shuffle",
     "uniform_files",
@@ -89,6 +94,10 @@ class TrainingConfig:
     train_segment_min_gap_sec: float | None = None
     train_sampling_mode: str = "shuffle"
     sampling_hz: int = 200
+    model_type: str = "cnn"
+    gru_hidden_dim: int = 64
+    gru_num_layers: int = 1
+    gru_bidirectional: bool = True
 
 
 def write_deploy_yaml(
@@ -108,6 +117,8 @@ def write_deploy_yaml(
     sampling_hz=200,
     gravity_comp_W=None,
     gravity_comp_b=None,
+    model_type="cnn",
+    architecture_metadata=None,
 ):
     feature_lines = []
     for name in selected_features:
@@ -135,6 +146,12 @@ def write_deploy_yaml(
         f"  num_timesteps: {num_timesteps}",
         f"  sampling_hz: {sampling_hz}",
         f"  window_ms: {window_ms}",
+        "architecture:",
+        f"  model_type: {model_type}",
+        *[
+            f"  {key}: {value}"
+            for key, value in (architecture_metadata or {}).items()
+        ],
         "features:",
         "  selected:",
         *feature_lines,
@@ -615,6 +632,11 @@ def validate_model_config(config: TrainingConfig):
         raise ValueError(
             f"derived_val_fraction must be between 0 and 1, got {config.derived_val_fraction}."
         )
+    if config.model_type not in ALLOWED_MODEL_TYPES:
+        raise ValueError(
+            f"model_type must be one of {sorted(ALLOWED_MODEL_TYPES)}, "
+            f"got {config.model_type!r}."
+        )
     if (
         config.val_x_filename is None
         and config.test_x_filename is None
@@ -678,6 +700,10 @@ def validate_model_config(config: TrainingConfig):
             f"train_sampling_mode must be one of {sorted(ALLOWED_TRAIN_SAMPLING_MODES)}, "
             f"got {config.train_sampling_mode!r}."
         )
+    if config.gru_hidden_dim <= 0:
+        raise ValueError(f"gru_hidden_dim must be positive, got {config.gru_hidden_dim}.")
+    if config.gru_num_layers <= 0:
+        raise ValueError(f"gru_num_layers must be positive, got {config.gru_num_layers}.")
 
 
 class PushCNN(nn.Module):
@@ -723,6 +749,112 @@ class PushCNN(nn.Module):
 
     def forward(self, x):
         return self.classifier(self.features(x))
+
+
+class PushGRU(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        num_classes,
+        seq_len,
+        hidden_dim,
+        num_layers,
+        bidirectional,
+        classifier_hidden_dim,
+        dropout,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_directions = 2 if bidirectional else 1
+        self.gru = nn.GRU(
+            input_size=in_channels,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * self.num_directions, classifier_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        # Deployment/runtime keeps the existing NCT input layout; recurrent layers use NTF.
+        x = x.transpose(1, 2)
+        _, h_n = self.gru(x)
+        h_n = h_n.view(self.num_layers, self.num_directions, x.size(0), self.hidden_dim)
+        last_layer_h = h_n[-1].transpose(0, 1).reshape(x.size(0), -1)
+        return self.classifier(last_layer_h)
+
+
+def build_model(config: TrainingConfig, in_channels, num_classes, seq_len):
+    if config.model_type == "cnn":
+        return PushCNN(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            seq_len=seq_len,
+            conv_channels=config.conv_channels,
+            kernel_sizes=config.kernel_sizes,
+            pool_after_layers=config.pool_after_layers,
+            classifier_hidden_dim=config.classifier_hidden_dim,
+            dropout=config.dropout,
+        )
+    if config.model_type == "gru":
+        return PushGRU(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            seq_len=seq_len,
+            hidden_dim=config.gru_hidden_dim,
+            num_layers=config.gru_num_layers,
+            bidirectional=config.gru_bidirectional,
+            classifier_hidden_dim=config.classifier_hidden_dim,
+            dropout=config.dropout,
+        )
+    raise ValueError(f"Unsupported model_type: {config.model_type!r}")
+
+
+def architecture_metadata(config: TrainingConfig):
+    if config.model_type == "cnn":
+        return {
+            "conv_channels": list(config.conv_channels),
+            "kernel_sizes": list(config.kernel_sizes),
+            "pool_after_layers": list(config.pool_after_layers),
+            "classifier_hidden_dim": config.classifier_hidden_dim,
+            "dropout": config.dropout,
+        }
+    if config.model_type == "gru":
+        return {
+            "gru_hidden_dim": config.gru_hidden_dim,
+            "gru_num_layers": config.gru_num_layers,
+            "gru_bidirectional": str(config.gru_bidirectional).lower(),
+            "classifier_hidden_dim": config.classifier_hidden_dim,
+            "dropout": config.dropout,
+        }
+    raise ValueError(f"Unsupported model_type: {config.model_type!r}")
+
+
+def format_model_description(config: TrainingConfig):
+    if config.model_type == "cnn":
+        return (
+            f"type=cnn | conv_channels={list(config.conv_channels)} | "
+            f"kernel_sizes={list(config.kernel_sizes)} | "
+            f"pool_after_layers={list(config.pool_after_layers)} | "
+            f"classifier_hidden_dim={config.classifier_hidden_dim} | "
+            f"dropout={config.dropout}"
+        )
+    if config.model_type == "gru":
+        return (
+            f"type=gru | hidden_dim={config.gru_hidden_dim} | "
+            f"num_layers={config.gru_num_layers} | "
+            f"bidirectional={config.gru_bidirectional} | "
+            f"classifier_hidden_dim={config.classifier_hidden_dim} | "
+            f"dropout={config.dropout}"
+        )
+    raise ValueError(f"Unsupported model_type: {config.model_type!r}")
 
 
 def run_training(config: TrainingConfig):
@@ -1005,15 +1137,11 @@ def run_training(config: TrainingConfig):
     )
 
     device = resolve_device()
-    model = PushCNN(
+    model = build_model(
+        config=config,
         in_channels=F,
         num_classes=num_classes,
         seq_len=T,
-        conv_channels=config.conv_channels,
-        kernel_sizes=config.kernel_sizes,
-        pool_after_layers=config.pool_after_layers,
-        classifier_hidden_dim=config.classifier_hidden_dim,
-        dropout=config.dropout,
     ).to(device)
 
     class_counts = np.bincount(y_train, minlength=num_classes).astype(np.float32)
@@ -1053,11 +1181,7 @@ def run_training(config: TrainingConfig):
     )
     print(
         "Model: "
-        f"conv_channels={list(config.conv_channels)} | "
-        f"kernel_sizes={list(config.kernel_sizes)} | "
-        f"pool_after_layers={list(config.pool_after_layers)} | "
-        f"classifier_hidden_dim={config.classifier_hidden_dim} | "
-        f"dropout={config.dropout}"
+        f"{format_model_description(config)}"
     )
     print(
         "Early stopping: "
@@ -1218,9 +1342,13 @@ def run_training(config: TrainingConfig):
                 "index_to_label": index_to_label,
                 "x_mean": x_mean,
                 "x_std": x_std,
+                "model_type": config.model_type,
                 "conv_channels": config.conv_channels,
                 "kernel_sizes": config.kernel_sizes,
                 "pool_after_layers": config.pool_after_layers,
+                "gru_hidden_dim": config.gru_hidden_dim,
+                "gru_num_layers": config.gru_num_layers,
+                "gru_bidirectional": config.gru_bidirectional,
                 "classifier_hidden_dim": config.classifier_hidden_dim,
                 "dropout": config.dropout,
                 "train_segment_min_gap_sec": config.train_segment_min_gap_sec,
@@ -1258,15 +1386,11 @@ def run_training(config: TrainingConfig):
         torch.save(best_state, checkpoint_path)
         print("Saved best model to:", checkpoint_path)
 
-        model_cpu = PushCNN(
+        model_cpu = build_model(
+            config=config,
             in_channels=F,
             num_classes=num_classes,
             seq_len=T,
-            conv_channels=config.conv_channels,
-            kernel_sizes=config.kernel_sizes,
-            pool_after_layers=config.pool_after_layers,
-            classifier_hidden_dim=config.classifier_hidden_dim,
-            dropout=config.dropout,
         ).cpu()
         model_cpu.load_state_dict(best_state["model_state_dict"])
         model_cpu.eval()
@@ -1279,6 +1403,7 @@ def run_training(config: TrainingConfig):
             dynamic_shapes={"x": {0: torch.export.Dim("batch_size")}},
             dynamo=True,
             opset_version=config.onnx_opset_version,
+            verbose=False,
         )
         print("Saved ONNX model to:", onnx_path)
 
@@ -1299,6 +1424,8 @@ def run_training(config: TrainingConfig):
             sampling_hz=config.sampling_hz,
             gravity_comp_W=gravity_comp_W,
             gravity_comp_b=gravity_comp_b,
+            model_type=config.model_type,
+            architecture_metadata=architecture_metadata(config),
         )
         print("Saved deploy metadata to:", deploy_yaml_path)
     else:

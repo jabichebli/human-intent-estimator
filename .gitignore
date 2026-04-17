@@ -3,6 +3,7 @@
 Thumbs.db
 .vscode/settings.json
 .claude/
+*.zip
 
 # Python/runtime cache
 __pycache__/
