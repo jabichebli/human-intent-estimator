@@ -10,6 +10,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "bag_data" / "processed_data" / "up_down"
 DATASET_TAG = "_w300_e060_hpure"
 TRAIN_BAGS = list(range(2, 29))
+ARM_FEATURE_WIDTH = FEATURE_SLICES["arm_angles"][1] - FEATURE_SLICES["arm_angles"][0]
 
 
 def optional_float(value):
@@ -38,6 +39,23 @@ def parse_args():
         choices=sorted(FEATURE_SLICES),
         default=["arm_angles", "arm_currents"],
         help="Feature blocks to feed the GRU.",
+    )
+    parser.add_argument(
+        "--arm-joints",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Optional 0-based arm joint indices to keep or drop inside arm_angles/arm_currents. "
+            f"Valid range: 0 to {ARM_FEATURE_WIDTH - 1}. For the current 7-wide arm vector, "
+            "the gripper is typically index 6."
+        ),
+    )
+    parser.add_argument(
+        "--arm-joint-mode",
+        choices=["keep", "drop"],
+        default="keep",
+        help="Interpret --arm-joints as the joints to keep or the joints to drop.",
     )
     parser.add_argument(
         "--epochs",
@@ -80,7 +98,38 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_arm_joint_indices(args):
+    if args.arm_joints is None:
+        return None
+
+    unique_joints = sorted(set(args.arm_joints))
+    invalid = [joint for joint in unique_joints if joint < 0 or joint >= ARM_FEATURE_WIDTH]
+    if invalid:
+        raise ValueError(
+            f"--arm-joints contains invalid indices {invalid}; valid range is 0 to {ARM_FEATURE_WIDTH - 1}."
+        )
+
+    if args.arm_joint_mode == "keep":
+        selected = unique_joints
+    else:
+        drop_set = set(unique_joints)
+        selected = [joint for joint in range(ARM_FEATURE_WIDTH) if joint not in drop_set]
+
+    if not selected:
+        raise ValueError("Resolved arm joint subset is empty. Choose at least one arm joint.")
+
+    return tuple(selected)
+
+
 def make_config(args):
+    arm_joint_indices = resolve_arm_joint_indices(args)
+    feature_subindices = None
+    if arm_joint_indices is not None:
+        feature_subindices = {
+            "arm_angles": arm_joint_indices,
+            "arm_currents": arm_joint_indices,
+        }
+
     return TrainingConfig(
         data_dir=DATA_DIR,
         train_x_filenames=[f"X_ud_{bag}{args.tag}.npy" for bag in args.bags],
@@ -94,6 +143,7 @@ def make_config(args):
         split_seed=42,
         selected_features=args.features,
         artifact_stem=args.artifact_stem,
+        feature_subindices=feature_subindices,
         export_artifacts=args.export_artifacts,
         batch_size=64,
         learning_rate=args.learning_rate,
@@ -129,4 +179,9 @@ if __name__ == "__main__":
     print(f"Training up/down GRU with tag: {args.tag}")
     print(f"Training up/down GRU with bags: {args.bags}")
     print(f"Training up/down GRU with features: {args.features}")
+    if args.arm_joints is not None:
+        print(
+            f"Training up/down GRU with arm_joints={args.arm_joints} "
+            f"(mode={args.arm_joint_mode})"
+        )
     run_training(make_config(args))

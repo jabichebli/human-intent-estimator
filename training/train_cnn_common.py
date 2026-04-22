@@ -62,6 +62,7 @@ class TrainingConfig:
     train_y_filenames: list[str]
     selected_features: list[str]
     artifact_stem: str
+    feature_subindices: dict[str, tuple[int, ...]] | None = None
     val_x_filename: str | None = None
     val_y_filename: str | None = None
     test_x_filename: str | None = None
@@ -114,6 +115,7 @@ def write_deploy_yaml(
     x_mean,
     x_std,
     selected_features,
+    feature_subindices,
     onnx_opset_version,
     delta_feature_mode,
     nonzero_prediction_threshold=None,
@@ -126,11 +128,16 @@ def write_deploy_yaml(
     feature_lines = []
     for name in selected_features:
         start, end = FEATURE_SLICES[name]
+        source_indices = None
+        if feature_subindices and name in feature_subindices:
+            source_indices = list(feature_subindices[name])
+        width = len(source_indices) if source_indices is not None else end - start
         feature_lines.extend([
             f"  - name: {name}",
             f"    source_start: {start}",
             f"    source_end: {end}",
-            f"    width: {end - start}",
+            *([f"    source_indices: {source_indices}"] if source_indices is not None else []),
+            f"    width: {width}",
         ])
 
     window_ms = int(round(num_timesteps / sampling_hz * 1000))
@@ -216,7 +223,14 @@ def remap_labels(y, label_to_index):
     return np.array([label_to_index[int(label)] for label in y], dtype=np.int64)
 
 
-def select_features(X, selected_features):
+def feature_width(name, feature_subindices=None):
+    start, end = FEATURE_SLICES[name]
+    if feature_subindices and name in feature_subindices:
+        return len(feature_subindices[name])
+    return end - start
+
+
+def select_features(X, selected_features, feature_subindices=None):
     for name in selected_features:
         if name not in FEATURE_SLICES:
             raise ValueError(f"Unknown feature name: {name}")
@@ -229,7 +243,17 @@ def select_features(X, selected_features):
                 f"requires columns [{start}:{end}). Rebuild the dataset tag with that "
                 "feature block available."
             )
-        blocks.append(X[:, :, start:end])
+        block = X[:, :, start:end]
+        if feature_subindices and name in feature_subindices:
+            subindices = feature_subindices[name]
+            invalid = [idx for idx in subindices if idx < 0 or idx >= (end - start)]
+            if invalid:
+                raise ValueError(
+                    f"Feature {name!r} has invalid subindices {invalid}; valid range is "
+                    f"[0, {end - start - 1}]."
+                )
+            block = block[:, :, list(subindices)]
+        blocks.append(block)
     return np.concatenate(blocks, axis=2)
 
 
@@ -979,10 +1003,10 @@ def run_training(config: TrainingConfig):
         y_val = remap_labels(y_val, label_to_index)
     y_test = remap_labels(y_test, label_to_index)
 
-    X_train = select_features(X_train, config.selected_features)
+    X_train = select_features(X_train, config.selected_features, config.feature_subindices)
     if X_val is not None:
-        X_val = select_features(X_val, config.selected_features)
-    X_test = select_features(X_test, config.selected_features)
+        X_val = select_features(X_val, config.selected_features, config.feature_subindices)
+    X_test = select_features(X_test, config.selected_features, config.feature_subindices)
 
     _, T, F = X_train.shape
     datasets_to_check = [("test", X_test)]
@@ -1041,7 +1065,7 @@ def run_training(config: TrainingConfig):
         offset = 0
         angle_start = angle_end = current_start = current_end = None
         for feat in config.selected_features:
-            w = FEATURE_SLICES[feat][1] - FEATURE_SLICES[feat][0]
+            w = feature_width(feat, config.feature_subindices)
             if feat == "arm_angles":
                 angle_start, angle_end = offset, offset + w
             elif feat == "arm_currents":
@@ -1188,6 +1212,8 @@ def run_training(config: TrainingConfig):
     )
 
     print(f"Device={device} | features={config.selected_features} | raw_labels={list(raw_label_set)}")
+    if config.feature_subindices:
+        print(f"Feature subindices={config.feature_subindices}")
     print_section("Run Setup")
     print(
         f"Input: timesteps={T}, features={F} | train_files={len(config.train_x_filenames)} | "
@@ -1432,6 +1458,7 @@ def run_training(config: TrainingConfig):
             x_mean,
             x_std,
             config.selected_features,
+            config.feature_subindices,
             config.onnx_opset_version,
             delta_feature_mode,
             nonzero_prediction_threshold=config.nonzero_prediction_threshold,
