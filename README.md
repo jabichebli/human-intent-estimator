@@ -14,7 +14,7 @@ Use `uv run` for normal CPU runs. You do not need to activate a virtualenv.
 
 | Task | Labels | Model | Dataset tag | Features | Inference |
 | --- | --- | --- | --- | --- | --- |
-| left/right | `0,3,4` = rest/left/right | GRU | `_w500_e060_hpure` | `ff accel dq` | argmax |
+| left/right | `0,3,4` = rest/left/right | GRU | `_w500_e060_hpure` | `accel dq` | argmax |
 | up/down | `0,5,6` = rest/up/down | GRU | `_w500_e060_hpure` | `arm_angles arm_currents` | argmax |
 
 Tag meaning:
@@ -67,7 +67,7 @@ uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_l
 Left/right GRU quick check:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type gru --heldout-bags 3 8 11 14 --epochs 35 --nonzero-threshold none --results-csv logs\quick_lr_gru_w500_e060_hpure_argmax.csv
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type gru --heldout-bags 3 8 11 14 --epochs 35 --nonzero-threshold none --results-csv logs\quick_lr_gru_w500_e060_hpure_noff_argmax.csv
 ```
 
 Optional CNN baseline, using the same parsed data and argmax inference:
@@ -81,7 +81,7 @@ Compare CSV summaries:
 
 ```powershell
 uv run python training\compare_lobo_results.py logs\quick_ud_gru_w500_e060_hpure_argmax.csv logs\quick_ud_cnn_w500_e060_hpure_argmax.csv
-uv run python training\compare_lobo_results.py logs\quick_lr_gru_w500_e060_hpure_argmax.csv logs\quick_lr_cnn_w500_e060_hpure_argmax.csv
+uv run python training\compare_lobo_results.py logs\quick_lr_gru_w500_e060_hpure_noff_argmax.csv logs\quick_lr_cnn_w500_e060_hpure_argmax.csv
 ```
 
 Prefer the model with stronger `avg_macro_f1`, `min_macro_f1`, and `min_worst_class_f1`.
@@ -99,7 +99,7 @@ uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_up_down_l
 Left/right full GRU LOBO:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type gru --nonzero-threshold none --results-csv logs\full_lr_gru_w500_e060_hpure_argmax.csv
+uv run --with numpy,torch,scikit-learn,matplotlib python training\eval_left_right_lobo.py --tag _w500_e060_hpure --model-type gru --nonzero-threshold none --results-csv logs\full_lr_gru_w500_e060_hpure_noff_argmax.csv
 ```
 
 Optional full CNN baselines:
@@ -113,7 +113,7 @@ Compare:
 
 ```powershell
 uv run python training\compare_lobo_results.py logs\full_ud_gru_w500_e060_hpure_argmax.csv logs\full_ud_cnn_w500_e060_hpure_argmax.csv
-uv run python training\compare_lobo_results.py logs\full_lr_gru_w500_e060_hpure_argmax.csv logs\full_lr_cnn_w500_e060_hpure_argmax.csv
+uv run python training\compare_lobo_results.py logs\full_lr_gru_w500_e060_hpure_noff_argmax.csv logs\full_lr_cnn_w500_e060_hpure_argmax.csv
 ```
 
 ## Train And Export
@@ -129,21 +129,21 @@ uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python trainin
 Left/right export:
 
 ```powershell
-uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_rnn_034.py --tag _w500_e060_hpure --nonzero-threshold none --artifact-stem intent_left_right_gru_w500_e060_hpure_argmax
+uv run --with numpy,torch,scikit-learn,matplotlib,onnx,onnxscript python training\train_rnn_034.py --tag _w500_e060_hpure --nonzero-threshold none --artifact-stem intent_left_right_gru_w500_e060_hpure_noff_argmax
 ```
 
 Check exported files:
 
 ```powershell
 Get-ChildItem bag_data\processed_data\up_down\models\intent_up_down_gru_w500_e060_hpure_argmax*
-Get-ChildItem bag_data\processed_data\left_right\models\intent_left_right_gru_w500_e060_hpure_argmax*
+Get-ChildItem bag_data\processed_data\left_right\models\intent_left_right_gru_w500_e060_hpure_noff_argmax*
 ```
 
 Inspect deploy metadata:
 
 ```powershell
 Get-Content bag_data\processed_data\up_down\models\intent_up_down_gru_w500_e060_hpure_argmax.deploy.yaml
-Get-Content bag_data\processed_data\left_right\models\intent_left_right_gru_w500_e060_hpure_argmax.deploy.yaml
+Get-Content bag_data\processed_data\left_right\models\intent_left_right_gru_w500_e060_hpure_noff_argmax.deploy.yaml
 ```
 
 The YAML should include:

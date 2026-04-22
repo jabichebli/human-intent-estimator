@@ -16,7 +16,7 @@ from train_cnn_common import (
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT_DIR / "bag_data" / "processed_data" / "left_right"
 DEFAULT_TAG = "_w300_e060_hpure"
-DEFAULT_FEATURES = ["ff", "accel", "dq"]
+DEFAULT_FEATURES = ["accel", "dq"]
 
 
 def optional_float(value):

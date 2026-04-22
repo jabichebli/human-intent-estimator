@@ -22,6 +22,9 @@ FEATURE_SLICES = {
     "dq": (19, 31),
     "arm_angles": (31, 38),
     "arm_currents": (38, 45),
+    "commanded_angles": (45, 52),
+    "command_error": (52, 59),
+    "command_delta": (59, 66),
 }
 
 ALLOWED_LABEL_SETS = [
@@ -217,7 +220,16 @@ def select_features(X, selected_features):
     for name in selected_features:
         if name not in FEATURE_SLICES:
             raise ValueError(f"Unknown feature name: {name}")
-    blocks = [X[:, :, FEATURE_SLICES[name][0]:FEATURE_SLICES[name][1]] for name in selected_features]
+    blocks = []
+    for name in selected_features:
+        start, end = FEATURE_SLICES[name]
+        if X.shape[2] < end:
+            raise ValueError(
+                f"Dataset only has {X.shape[2]} raw features, but feature {name!r} "
+                f"requires columns [{start}:{end}). Rebuild the dataset tag with that "
+                "feature block available."
+            )
+        blocks.append(X[:, :, start:end])
     return np.concatenate(blocks, axis=2)
 
 

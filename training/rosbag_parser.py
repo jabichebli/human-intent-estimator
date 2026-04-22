@@ -14,7 +14,8 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed_data"
 
 PUSH_EVENT_TOPIC = "/data/push_event"
 LOWSTATE_TOPIC = "/lowstate"
-ARM_ANGLES_TOPIC = "/arm_angles"
+ARM_STATE_TOPICS = ["/arm/state", "/arm_angles"]
+COMMAND_ANGLES_TOPIC = "/arm/commanded_angles"
 ARM_ANGLE_DIM = 7
 ARM_CURRENT_DIM = 7
 
@@ -25,6 +26,7 @@ push_labels_raw = []
 
 lowstate_t_ns = []
 arm_angles_t_ns = []
+commanded_angles_t_ns = []
 
 lowstate_ff = []
 lowstate_accel = []
@@ -32,6 +34,7 @@ lowstate_q = []
 lowstate_dq = []
 arm_angles = []
 arm_currents = []
+commanded_angles = []
 
 
 def parse_args():
@@ -214,6 +217,14 @@ def get_topic_connections(reader, topic, required):
     return connections
 
 
+def get_first_available_topic_connections(reader, topics):
+    for topic in topics:
+        connections = get_topic_connections(reader, topic, required=False)
+        if connections:
+            return topic, connections
+    return None, []
+
+
 def extract_arm_angle_features(msg):
     return [msg.angle_deg[i] for i in range(ARM_ANGLE_DIM)]
 
@@ -236,7 +247,8 @@ def extract_arm_current_features(msg):
 with AnyReader([bagpath]) as reader:
     push_connections = get_topic_connections(reader, PUSH_EVENT_TOPIC, required=True)
     lowstate_connections = get_topic_connections(reader, LOWSTATE_TOPIC, required=True)
-    arm_angles_connections = get_topic_connections(reader, ARM_ANGLES_TOPIC, required=False)
+    arm_topic, arm_state_connections = get_first_available_topic_connections(reader, ARM_STATE_TOPICS)
+    commanded_angles_connections = get_topic_connections(reader, COMMAND_ANGLES_TOPIC, required=False)
 
     # Read all push-event timestamps and raw labels.
     for connection, timestamp, rawdata in reader.messages(connections=push_connections):
@@ -244,12 +256,20 @@ with AnyReader([bagpath]) as reader:
         push_t_ns.append(timestamp)
         push_labels_raw.append(int(msg.label))
 
-    # Read /arm_angles when present.
-    for connection, timestamp, rawdata in reader.messages(connections=arm_angles_connections):
-        msg = reader.deserialize(rawdata, connection.msgtype)
-        arm_angles_t_ns.append(timestamp)
-        arm_angles.append(extract_arm_angle_features(msg))
-        arm_currents.append(extract_arm_current_features(msg))
+    # Read whichever arm-state topic this bag exposes.
+    if arm_state_connections:
+        for connection, timestamp, rawdata in reader.messages(connections=arm_state_connections):
+            msg = reader.deserialize(rawdata, connection.msgtype)
+            arm_angles_t_ns.append(timestamp)
+            arm_angles.append(extract_arm_angle_features(msg))
+            arm_currents.append(extract_arm_current_features(msg))
+
+    # Read commanded arm angles when present.
+    if commanded_angles_connections:
+        for connection, timestamp, rawdata in reader.messages(connections=commanded_angles_connections):
+            msg = reader.deserialize(rawdata, connection.msgtype)
+            commanded_angles_t_ns.append(timestamp)
+            commanded_angles.append(extract_arm_angle_features(msg))
 
     # Read /lowstate.
     for connection, timestamp, rawdata in reader.messages(connections=lowstate_connections):
@@ -306,6 +326,8 @@ push_labels[push_labels_raw == keep_label_2_raw] = keep_label_2_raw
 
 lowstate_t_ns = np.array(lowstate_t_ns, dtype=np.int64)
 arm_angles_t_ns = np.array(arm_angles_t_ns, dtype=np.int64)
+commanded_angles_t_ns = np.array(commanded_angles_t_ns, dtype=np.int64)
+has_commanded_angles = len(commanded_angles_t_ns) > 0
 
 if len(lowstate_t_ns) == 0:
     raise ValueError(f"No messages found on required topic {LOWSTATE_TOPIC!r} in {bagpath}.")
@@ -316,11 +338,16 @@ lowstate_q = np.array(lowstate_q, dtype=np.float32)
 lowstate_dq = np.array(lowstate_dq, dtype=np.float32)
 arm_angles = np.array(arm_angles, dtype=np.float32)
 arm_currents = np.array(arm_currents, dtype=np.float32)
+commanded_angles = np.array(commanded_angles, dtype=np.float32)
 
 if len(arm_angles_t_ns) == 0:
     arm_angles_t_ns = lowstate_t_ns.copy()
     arm_angles = np.zeros((len(lowstate_t_ns), ARM_ANGLE_DIM), dtype=np.float32)
     arm_currents = np.zeros((len(lowstate_t_ns), ARM_CURRENT_DIM), dtype=np.float32)
+
+if len(commanded_angles_t_ns) == 0:
+    commanded_angles_t_ns = lowstate_t_ns.copy()
+    commanded_angles = np.zeros((len(lowstate_t_ns), ARM_ANGLE_DIM), dtype=np.float32)
 
 print("raw label counts:", {k: int(np.sum(push_labels_raw == k)) for k in range(7)})
 print("processed label counts:", {k: int(np.sum(push_labels == k)) for k in [0] + kept_labels})
@@ -331,12 +358,15 @@ print("require_full_history_in_segment:", require_full_history_in_segment)
 
 print("lowstate_t_ns shape:", lowstate_t_ns.shape)
 print("arm_angles_t_ns shape:", arm_angles_t_ns.shape)
+print("commanded_angles_t_ns shape:", commanded_angles_t_ns.shape)
 print("lowstate_ff shape:", lowstate_ff.shape)
 print("lowstate_accel shape:", lowstate_accel.shape)
 print("lowstate_q shape:", lowstate_q.shape)
 print("lowstate_dq shape:", lowstate_dq.shape)
+print("arm_topic:", arm_topic if arm_topic is not None else "none")
 print("arm_angles shape:", arm_angles.shape)
 print("arm_currents shape:", arm_currents.shape)
+print("commanded_angles shape:", commanded_angles.shape)
 
 # ----------------
 # Build segments from remapped label stream
@@ -363,6 +393,8 @@ for t_ns, label, segment_id in zip(push_t_ns, push_labels, push_segment_ids):
     if window_start_ns < lowstate_t_ns[0]:
         continue
     if window_start_ns < arm_angles_t_ns[0]:
+        continue
+    if window_start_ns < commanded_angles_t_ns[0]:
         continue
     if require_full_history_in_segment and window_start_ns < segment_start_ns_by_id[segment_id]:
         dropped_history_crossing += 1
@@ -433,17 +465,39 @@ X_q = []
 X_dq = []
 X_arm_angles = []
 X_arm_currents = []
+X_commanded_angles = []
+X_command_error = []
+X_command_delta = []
 y = []
 valid_t_ns = []
 valid_segment_ids = []
 
 for i in range(len(grid_ns)):
-    X_ff.append(sample_nearest(lowstate_t_ns, lowstate_ff, grid_ns[i]))
-    X_accel.append(sample_nearest(lowstate_t_ns, lowstate_accel, grid_ns[i]))
-    X_q.append(sample_nearest(lowstate_t_ns, lowstate_q, grid_ns[i]))
-    X_dq.append(sample_nearest(lowstate_t_ns, lowstate_dq, grid_ns[i]))
-    X_arm_angles.append(sample_nearest(arm_angles_t_ns, arm_angles, grid_ns[i]))
-    X_arm_currents.append(sample_nearest(arm_angles_t_ns, arm_currents, grid_ns[i]))
+    ff_window = sample_nearest(lowstate_t_ns, lowstate_ff, grid_ns[i])
+    accel_window = sample_nearest(lowstate_t_ns, lowstate_accel, grid_ns[i])
+    q_window = sample_nearest(lowstate_t_ns, lowstate_q, grid_ns[i])
+    dq_window = sample_nearest(lowstate_t_ns, lowstate_dq, grid_ns[i])
+    arm_angle_window = sample_nearest(arm_angles_t_ns, arm_angles, grid_ns[i])
+    arm_current_window = sample_nearest(arm_angles_t_ns, arm_currents, grid_ns[i])
+    commanded_angle_window = sample_nearest(commanded_angles_t_ns, commanded_angles, grid_ns[i])
+
+    if has_commanded_angles:
+        command_error_window = commanded_angle_window - arm_angle_window
+        command_delta_window = np.zeros_like(commanded_angle_window)
+        command_delta_window[1:] = commanded_angle_window[1:] - commanded_angle_window[:-1]
+    else:
+        command_error_window = np.zeros_like(commanded_angle_window)
+        command_delta_window = np.zeros_like(commanded_angle_window)
+
+    X_ff.append(ff_window)
+    X_accel.append(accel_window)
+    X_q.append(q_window)
+    X_dq.append(dq_window)
+    X_arm_angles.append(arm_angle_window)
+    X_arm_currents.append(arm_current_window)
+    X_commanded_angles.append(commanded_angle_window)
+    X_command_error.append(command_error_window)
+    X_command_delta.append(command_delta_window)
 
     y.append(selected_labels[i])
     valid_t_ns.append(selected_t_ns[i])
@@ -455,6 +509,12 @@ X_q = np.stack(X_q, axis=0)
 X_dq = np.stack(X_dq, axis=0)
 X_arm_angles = np.stack(X_arm_angles, axis=0)
 X_arm_currents = np.stack(X_arm_currents, axis=0)
+X_commanded_angles = np.stack(X_commanded_angles, axis=0)
+X_command_error = np.stack(X_command_error, axis=0)
+X_command_delta = np.stack(X_command_delta, axis=0)
+
+print("command_error shape:", X_command_error.shape)
+print("command_delta shape:", X_command_delta.shape)
 
 y = np.array(y, dtype=np.int64)
 valid_t_ns = np.array(valid_t_ns, dtype=np.int64)
@@ -462,7 +522,17 @@ valid_segment_ids = np.array(valid_segment_ids, dtype=np.int64)
 
 print("final class counts:", {k: int(np.sum(y == k)) for k in [0] + kept_labels})
 
-feature_blocks = [X_ff, X_accel, X_q, X_dq, X_arm_angles, X_arm_currents]
+feature_blocks = [
+    X_ff,
+    X_accel,
+    X_q,
+    X_dq,
+    X_arm_angles,
+    X_arm_currents,
+    X_commanded_angles,
+    X_command_error,
+    X_command_delta,
+]
 X = np.concatenate(feature_blocks, axis=2)
 
 print("X shape:", X.shape)
