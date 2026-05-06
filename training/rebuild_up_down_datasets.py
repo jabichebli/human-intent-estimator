@@ -78,6 +78,17 @@ def parse_args():
         action="store_true",
         help="Print parser commands without running them.",
     )
+    parser.add_argument(
+        "--arm-excluded-joints",
+        nargs="*",
+        type=int,
+        default=[0, 3, 5, 6],
+        metavar="J",
+        help=(
+            "Arm joint indices to exclude. Default: 0 3 5 6. "
+            "Pass no indices to keep all 7 joints."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -197,6 +208,9 @@ def parser_command(bag_id, args):
         command.append("--require-full-history-in-segment")
     if args.no_downsample_zero_class:
         command.append("--no-downsample-zero-class")
+    if args.arm_excluded_joints is not None:
+        command.append("--arm-excluded-joints")
+        command.extend(str(j) for j in args.arm_excluded_joints)
     return command
 
 

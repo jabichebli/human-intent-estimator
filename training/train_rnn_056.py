@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 
-from train_cnn_common import FEATURE_SLICES, TrainingConfig, run_training
+from train_cnn_common import ALLOWED_MODEL_TYPES, FEATURE_SLICES, TrainingConfig, run_training
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -46,9 +46,18 @@ def parse_args():
         help="Number of training epochs.",
     )
     parser.add_argument(
+        "--model-type",
+        default="gru", # Set GRU as the default
+        choices=sorted(ALLOWED_MODEL_TYPES), # Allow all models
+        help="Model architecture: 'cnn', 'gru', 'lstm', or 'tcn'.",
+    )
+    parser.add_argument(
         "--artifact-stem",
-        default="intent_up_down_gru",
-        help="Output artifact stem under the up/down models folder.",
+        default=None,
+        help=(
+            "Output artifact stem under the up/down models folder. "
+            "Defaults to 'intent_up_down_<model-type>'."
+        ),
     )
     parser.add_argument(
         "--nonzero-threshold",
@@ -81,6 +90,7 @@ def parse_args():
 
 
 def make_config(args):
+    artifact_stem = args.artifact_stem or f"intent_up_down_{args.model_type}"
     return TrainingConfig(
         data_dir=DATA_DIR,
         train_x_filenames=[f"X_ud_{bag}{args.tag}.npy" for bag in args.bags],
@@ -93,7 +103,7 @@ def make_config(args):
         derived_split_mode="stratified_segments",
         split_seed=42,
         selected_features=args.features,
-        artifact_stem=args.artifact_stem,
+        artifact_stem=artifact_stem,
         export_artifacts=args.export_artifacts,
         batch_size=64,
         learning_rate=args.learning_rate,
@@ -117,7 +127,7 @@ def make_config(args):
         append_delta_features=True,
         use_gravity_comp=False,
         train_sampling_mode="uniform_files",
-        model_type="gru",
+        model_type=args.model_type,
         gru_hidden_dim=args.hidden_dim,
         gru_num_layers=args.num_layers,
         gru_bidirectional=True,
@@ -126,7 +136,7 @@ def make_config(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    print(f"Training up/down GRU with tag: {args.tag}")
-    print(f"Training up/down GRU with bags: {args.bags}")
-    print(f"Training up/down GRU with features: {args.features}")
+    print(f"Training up/down {args.model_type.upper()} with tag: {args.tag}")
+    print(f"Training up/down {args.model_type.upper()} with bags: {args.bags}")
+    print(f"Training up/down {args.model_type.upper()} with features: {args.features}")
     run_training(make_config(args))

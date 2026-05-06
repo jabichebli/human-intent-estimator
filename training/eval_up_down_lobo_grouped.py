@@ -117,7 +117,39 @@ def parse_args():
         default=None,
         help="Optional CSV path for one row per held-out group plus one summary row.",
     )
+    parser.add_argument(
+        "--arm-joints",
+        nargs="*",
+        type=int,
+        default=None,
+        metavar="J",
+        help=(
+            "Arm joint indices to act on (0-based within the arm array). "
+            "Combined with --arm-joint-mode. Default: use all joints present in data."
+        ),
+    )
+    parser.add_argument(
+        "--arm-joint-mode",
+        default="keep",
+        choices=["keep", "drop"],
+        help=(
+            "'keep' — keep only the listed --arm-joints (default). "
+            "'drop' — exclude the listed --arm-joints, keep the rest."
+        ),
+    )
     return parser.parse_args()
+
+
+def resolve_arm_kept_joints(arm_joints, arm_joint_mode, total_arm_joints=7):
+    """Translate --arm-joints / --arm-joint-mode into a kept-joints list or None."""
+    if arm_joints is None:
+        return None  # no filtering — keep whatever the data has
+    all_joints = list(range(total_arm_joints))
+    if arm_joint_mode == "drop":
+        drop_set = set(arm_joints)
+        return [j for j in all_joints if j not in drop_set]
+    else:  # keep
+        return sorted(arm_joints)
 
 
 def file_digest(path):
@@ -161,6 +193,7 @@ def make_config(
 ) -> TrainingConfig:
     use_delta_features = args.delta_mode == "replace"
     append_delta_features = args.delta_mode == "append"
+    arm_kept_joints = resolve_arm_kept_joints(args.arm_joints, args.arm_joint_mode)
     return TrainingConfig(
         data_dir=DATA_DIR,
         train_x_filenames=[f"X_ud_{bag}{args.tag}.npy" for bag in train_bags],
@@ -205,6 +238,7 @@ def make_config(
         gru_hidden_dim=args.gru_hidden_dim,
         gru_num_layers=args.gru_num_layers,
         gru_bidirectional=True,
+        arm_kept_joints=arm_kept_joints,
     )
 
 

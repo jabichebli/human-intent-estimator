@@ -20,8 +20,11 @@ FEATURE_SLICES = {
     "accel": (4, 7),
     "q": (7, 19),
     "dq": (19, 31),
-    "arm_angles": (31, 38),
-    "arm_currents": (38, 45),
+    "arm_angles":   (31, 34),  # 3 joints (1, 2, 4); joints 0, 3, 5, 6 excluded at parse time
+    "arm_currents": (34, 37),  # 3 joints (1, 2, 4); same exclusion
+    # icon_lab_d1_ros2 bags (e.g. go2_data_ud_1) add two more arm blocks → 43 features total
+    "arm_velocities": (37, 40),  # velocity_deg_s from /arm/servo_feedback
+    "last_action":    (40, 43),  # last commanded angle from /arm/servo_command
 }
 
 ALLOWED_LABEL_SETS = [
@@ -39,6 +42,8 @@ ALLOWED_SELECTION_METRICS = {
 ALLOWED_MODEL_TYPES = {
     "cnn",
     "gru",
+    "lstm",
+    "tcn",
 }
 
 ALLOWED_TRAIN_SAMPLING_MODES = {
@@ -98,6 +103,7 @@ class TrainingConfig:
     gru_hidden_dim: int = 64
     gru_num_layers: int = 1
     gru_bidirectional: bool = True
+    arm_kept_joints: list[int] | None = None  # None = keep all arm joints present in the data
 
 
 def write_deploy_yaml(
@@ -119,10 +125,12 @@ def write_deploy_yaml(
     gravity_comp_b=None,
     model_type="cnn",
     architecture_metadata=None,
+    feature_slices=None,
 ):
+    slices = feature_slices if feature_slices is not None else FEATURE_SLICES
     feature_lines = []
     for name in selected_features:
-        start, end = FEATURE_SLICES[name]
+        start, end = slices[name]
         feature_lines.extend([
             f"  - name: {name}",
             f"    source_start: {start}",
@@ -164,15 +172,19 @@ def write_deploy_yaml(
         "inference:",
         "  output_type: logits",
         "  postprocess: softmax",
-        "  prediction_rule: nonzero_threshold",
+        "  prediction_rule: argmax",
         f"  nonzero_prediction_threshold: {nonzero_prediction_threshold if nonzero_prediction_threshold is not None else 'null'}",
         "  zero_index: 0",
         "  nonzero_indices: [1, 2]",
+        "  score_smoothing:",
+        "    method: ema",
+        "    ema_alpha: 0.2",
+        "    moving_average_window: 5",
         "preprocessing:",
         "  normalize: true",
         f"  delta_features: {str(delta_feature_mode != 'off').lower()}",
         f"  delta_feature_mode: {delta_feature_mode}",
-        # 'append' mode: concat [raw, raw - raw[0]] along feature axis.
+        # 'append' mode: concat [raw, raw - raw[window_start]] along feature axis.
         # delta[t] = raw[t] - raw[window_start], NOT frame-to-frame differences.
         # x_mean/x_std cover the full concatenated vector (raw + delta).
         *([
@@ -213,11 +225,84 @@ def remap_labels(y, label_to_index):
     return np.array([label_to_index[int(label)] for label in y], dtype=np.int64)
 
 
-def select_features(X, selected_features):
+def feature_slices_for_data(total_raw_features):
+    """Return a FEATURE_SLICES dict whose arm bounds match the actual data dimensionality.
+
+    Fixed prefix: ff(4) + accel(3) + q(12) + dq(12) = 31 features.
+    Remaining features are one of:
+      • 6  features → 2 arm blocks: arm_angles(3) + arm_currents(3)          [37 total, stacks 1–2]
+      • 12 features → 4 arm blocks: arm_angles(3) + arm_currents(3)
+                                   + arm_velocity(3) + arm_command(3)         [43 total, stack 3]
+    The per-block size (arm_dim) is inferred as arm_total / n_blocks.
+    Divisibility by 4 is tried first so 12-feature arms are recognised as 4 blocks, not 2×6.
+    """
+    base = 31
+    arm_total = total_raw_features - base
+
+    # Detect 4-block (icon_lab_d1_ros2) vs 2-block (older stacks)
+    if arm_total % 4 == 0 and arm_total > 0:
+        arm_dim = arm_total // 4
+        return {
+            "ff":             (0,    4),
+            "accel":          (4,    7),
+            "q":              (7,   19),
+            "dq":             (19,  31),
+            "arm_angles":     (base,             base + arm_dim),
+            "arm_currents":   (base + arm_dim,   base + 2 * arm_dim),
+            "arm_velocities": (base + 2*arm_dim, base + 3 * arm_dim),
+            "last_action":    (base + 3*arm_dim, base + 4 * arm_dim),
+        }
+    # Default: 2-block (angle + current)
+    arm_dim = arm_total // 2
+    return {
+        "ff":           (0,   4),
+        "accel":        (4,   7),
+        "q":            (7,  19),
+        "dq":           (19, 31),
+        "arm_angles":   (base,           base + arm_dim),
+        "arm_currents": (base + arm_dim, base + 2 * arm_dim),
+    }
+
+
+def apply_arm_joint_mask(X, selected_features, arm_kept_joints, feature_slices):
+    """Within the already-selected feature matrix X, further sub-select arm joints.
+
+    After select_features, all arm_* feature blocks occupy contiguous columns
+    whose width equals the number of joints in the parsed data.  This function
+    keeps only the columns corresponding to arm_kept_joints (0-based indices into
+    the arm joint array), rebuilding X with the pruned arm columns in place.
+
+    Features other than arm_* blocks are kept as-is.
+    """
+    arm_features = {"arm_angles", "arm_currents", "arm_velocities", "last_action"}
+    selected_arm = [f for f in selected_features if f in arm_features]
+    if not selected_arm:
+        return X  # no arm features selected, nothing to mask
+
+    # Compute per-feature widths AFTER select_features so we can find column offsets.
+    col_offset = 0
+    keep_cols = []
+    for feat in selected_features:
+        start, end = feature_slices[feat]
+        width = end - start
+        if feat in arm_features:
+            # width == number of joints in the parsed data
+            num_parsed_joints = width
+            valid_joints = [j for j in arm_kept_joints if j < num_parsed_joints]
+            keep_cols.extend(col_offset + j for j in valid_joints)
+        else:
+            keep_cols.extend(range(col_offset, col_offset + width))
+        col_offset += width
+
+    return X[:, :, keep_cols]
+
+
+def select_features(X, selected_features, feature_slices=None):
+    slices = feature_slices if feature_slices is not None else FEATURE_SLICES
     for name in selected_features:
-        if name not in FEATURE_SLICES:
+        if name not in slices:
             raise ValueError(f"Unknown feature name: {name}")
-    blocks = [X[:, :, FEATURE_SLICES[name][0]:FEATURE_SLICES[name][1]] for name in selected_features]
+    blocks = [X[:, :, slices[name][0]:slices[name][1]] for name in selected_features]
     return np.concatenate(blocks, axis=2)
 
 
@@ -793,6 +878,108 @@ class PushGRU(nn.Module):
         return self.classifier(last_layer_h)
 
 
+class PushLSTM(nn.Module):
+    """LSTM variant of PushGRU.
+
+    LSTM returns (output, (h_n, c_n)); we take only h_n (hidden state) from
+    the last layer and discard c_n (cell state), matching the GRU interface.
+    Everything else — bidirectional concat, classifier head, NCT→NTF transpose
+    — is identical to PushGRU so the two are directly comparable.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        num_classes,
+        seq_len,
+        hidden_dim,
+        num_layers,
+        bidirectional,
+        classifier_hidden_dim,
+        dropout,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_directions = 2 if bidirectional else 1
+        self.lstm = nn.LSTM(
+            input_size=in_channels,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+            # PyTorch only applies inter-layer dropout (num_layers > 1).
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * self.num_directions, classifier_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        # Deployment/runtime keeps the existing NCT input layout; recurrent layers use NTF.
+        x = x.transpose(1, 2)
+        # LSTM returns (output, (h_n, c_n)); discard cell state.
+        _, (h_n, _) = self.lstm(x)
+        h_n = h_n.view(self.num_layers, self.num_directions, x.size(0), self.hidden_dim)
+        last_layer_h = h_n[-1].transpose(0, 1).reshape(x.size(0), -1)
+        return self.classifier(last_layer_h)
+
+class PushTCN(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        num_classes,
+        seq_len,
+        conv_channels,
+        kernel_sizes,
+        classifier_hidden_dim,
+        dropout,
+    ):
+        super().__init__()
+        layers = []
+        prev_channels = in_channels
+        
+        # Build dilated causal convolutions
+        dilation_size = 1
+        for out_channels, kernel_size in zip(conv_channels, kernel_sizes):
+            # Causal padding ensures we don't look into the future
+            padding = (kernel_size - 1) * dilation_size
+            layers.append(
+                nn.Conv1d(
+                    prev_channels, 
+                    out_channels, 
+                    kernel_size=kernel_size,
+                    padding=padding,
+                    dilation=dilation_size
+                )
+            )
+            layers.append(nn.BatchNorm1d(out_channels))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+            prev_channels = out_channels
+            dilation_size *= 2  # Exponentially increase receptive field
+            
+        self.features = nn.Sequential(*layers)
+        self.classifier = nn.Sequential(
+            nn.Linear(prev_channels, classifier_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(classifier_hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        # x shape: (Batch, Channels, Time)
+        out = self.features(x)
+        # Because of causal padding, crop the right side to maintain seq_len
+        out = out[:, :, :x.size(2)] 
+        
+        # Global Average Pooling across the time dimension
+        pooled = out.mean(dim=2) 
+        return self.classifier(pooled)
+
 def build_model(config: TrainingConfig, in_channels, num_classes, seq_len):
     if config.model_type == "cnn":
         return PushCNN(
@@ -816,6 +1003,27 @@ def build_model(config: TrainingConfig, in_channels, num_classes, seq_len):
             classifier_hidden_dim=config.classifier_hidden_dim,
             dropout=config.dropout,
         )
+    if config.model_type == "lstm":
+        return PushLSTM(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            seq_len=seq_len,
+            hidden_dim=config.gru_hidden_dim,
+            num_layers=config.gru_num_layers,
+            bidirectional=config.gru_bidirectional,
+            classifier_hidden_dim=config.classifier_hidden_dim,
+            dropout=config.dropout,
+        )
+    if config.model_type == "tcn":
+        return PushTCN(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            seq_len=seq_len,
+            conv_channels=config.conv_channels,
+            kernel_sizes=config.kernel_sizes,
+            classifier_hidden_dim=config.classifier_hidden_dim,
+            dropout=config.dropout,
+        )
     raise ValueError(f"Unsupported model_type: {config.model_type!r}")
 
 
@@ -836,6 +1044,21 @@ def architecture_metadata(config: TrainingConfig):
             "classifier_hidden_dim": config.classifier_hidden_dim,
             "dropout": config.dropout,
         }
+    if config.model_type == "lstm":
+        return {
+            "lstm_hidden_dim": config.gru_hidden_dim,
+            "lstm_num_layers": config.gru_num_layers,
+            "lstm_bidirectional": str(config.gru_bidirectional).lower(),
+            "classifier_hidden_dim": config.classifier_hidden_dim,
+            "dropout": config.dropout,
+        }
+    if config.model_type == "tcn":
+        return {
+            "conv_channels": list(config.conv_channels),
+            "kernel_sizes": list(config.kernel_sizes),
+            "classifier_hidden_dim": config.classifier_hidden_dim,
+            "dropout": config.dropout,
+        }
     raise ValueError(f"Unsupported model_type: {config.model_type!r}")
 
 
@@ -853,6 +1076,21 @@ def format_model_description(config: TrainingConfig):
             f"type=gru | hidden_dim={config.gru_hidden_dim} | "
             f"num_layers={config.gru_num_layers} | "
             f"bidirectional={config.gru_bidirectional} | "
+            f"classifier_hidden_dim={config.classifier_hidden_dim} | "
+            f"dropout={config.dropout}"
+        )
+    if config.model_type == "lstm":
+        return (
+            f"type=lstm | hidden_dim={config.gru_hidden_dim} | "
+            f"num_layers={config.gru_num_layers} | "
+            f"bidirectional={config.gru_bidirectional} | "
+            f"classifier_hidden_dim={config.classifier_hidden_dim} | "
+            f"dropout={config.dropout}"
+        )
+    if config.model_type == "tcn":
+        return (
+            f"type=tcn | conv_channels={list(config.conv_channels)} | "
+            f"kernel_sizes={list(config.kernel_sizes)} | "
             f"classifier_hidden_dim={config.classifier_hidden_dim} | "
             f"dropout={config.dropout}"
         )
@@ -967,10 +1205,24 @@ def run_training(config: TrainingConfig):
         y_val = remap_labels(y_val, label_to_index)
     y_test = remap_labels(y_test, label_to_index)
 
-    X_train = select_features(X_train, config.selected_features)
+    # Derive feature slices from the actual data shape so arm_angles / arm_currents
+    # bounds are always correct regardless of how many joints were kept at parse time.
+    _raw_feature_dim = X_train.shape[2]
+    _active_slices = feature_slices_for_data(_raw_feature_dim)
+    print(f"[Info] Raw feature dim={_raw_feature_dim}, active slices: {_active_slices}")
+
+    X_train = select_features(X_train, config.selected_features, _active_slices)
     if X_val is not None:
-        X_val = select_features(X_val, config.selected_features)
-    X_test = select_features(X_test, config.selected_features)
+        X_val = select_features(X_val, config.selected_features, _active_slices)
+    X_test = select_features(X_test, config.selected_features, _active_slices)
+
+    # Optionally sub-select specific arm joints within the selected feature matrix.
+    if config.arm_kept_joints is not None:
+        print(f"[Info] Masking arm joints — keeping indices {config.arm_kept_joints}")
+        X_train = apply_arm_joint_mask(X_train, config.selected_features, config.arm_kept_joints, _active_slices)
+        if X_val is not None:
+            X_val = apply_arm_joint_mask(X_val, config.selected_features, config.arm_kept_joints, _active_slices)
+        X_test = apply_arm_joint_mask(X_test, config.selected_features, config.arm_kept_joints, _active_slices)
 
     _, T, F = X_train.shape
     datasets_to_check = [("test", X_test)]
@@ -1006,6 +1258,9 @@ def run_training(config: TrainingConfig):
         X_test = X_test - X_test[:, 0:1, :]
         delta_feature_mode = "replace"
     elif config.append_delta_features:
+        # Subtract the first timestep from every timestep in each window.
+        # delta[t] = X[t] - X[window_start], NOT frame-to-frame differences.
+        # x_mean/x_std cover the full concatenated vector (raw + delta).
         X_train = np.concatenate([X_train, X_train - X_train[:, 0:1, :]], axis=2)
         if X_val is not None:
             X_val = np.concatenate([X_val, X_val - X_val[:, 0:1, :]], axis=2)
@@ -1428,6 +1683,7 @@ def run_training(config: TrainingConfig):
             gravity_comp_b=gravity_comp_b,
             model_type=config.model_type,
             architecture_metadata=architecture_metadata(config),
+            feature_slices=_active_slices,
         )
         print("Saved deploy metadata to:", deploy_yaml_path)
     else:

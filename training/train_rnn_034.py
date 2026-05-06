@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from train_cnn_common import (
+    ALLOWED_MODEL_TYPES,
     ALLOWED_SELECTION_METRICS,
     FEATURE_SLICES,
     TrainingConfig,
@@ -47,9 +48,18 @@ def parse_args():
     )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument(
+        "--model-type",
+        default="gru",
+        choices=sorted(ALLOWED_MODEL_TYPES - {"cnn"}),
+        help="Recurrent model architecture: 'gru' or 'lstm'.",
+    )
+    parser.add_argument(
         "--artifact-stem",
-        default="intent_left_right_gru",
-        help="Output artifact stem under the left/right models folder.",
+        default=None,
+        help=(
+            "Output artifact stem under the left/right models folder. "
+            "Defaults to 'intent_left_right_<model-type>'."
+        ),
     )
     parser.add_argument(
         "--nonzero-threshold",
@@ -87,6 +97,7 @@ def parse_args():
 
 
 def make_config(args):
+    artifact_stem = args.artifact_stem or f"intent_left_right_{args.model_type}"
     return TrainingConfig(
         data_dir=DATA_DIR,
         train_x_filenames=[f"X_lr_{bag}{args.tag}.npy" for bag in args.bags],
@@ -99,7 +110,7 @@ def make_config(args):
         derived_split_mode="stratified_windows",
         split_seed=42,
         selected_features=args.features,
-        artifact_stem=args.artifact_stem,
+        artifact_stem=artifact_stem,
         export_artifacts=args.export_artifacts,
         batch_size=64,
         learning_rate=args.learning_rate,
@@ -123,7 +134,7 @@ def make_config(args):
         append_delta_features=True,
         use_gravity_comp=False,
         train_sampling_mode="uniform_files",
-        model_type="gru",
+        model_type=args.model_type,
         gru_hidden_dim=args.hidden_dim,
         gru_num_layers=args.num_layers,
         gru_bidirectional=True,
@@ -132,7 +143,7 @@ def make_config(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    print(f"Training left/right GRU with tag: {args.tag}")
-    print(f"Training left/right GRU with bags: {args.bags}")
-    print(f"Training left/right GRU with features: {args.features}")
+    print(f"Training left/right {args.model_type.upper()} with tag: {args.tag}")
+    print(f"Training left/right {args.model_type.upper()} with bags: {args.bags}")
+    print(f"Training left/right {args.model_type.upper()} with features: {args.features}")
     run_training(make_config(args))
